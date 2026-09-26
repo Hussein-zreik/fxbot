@@ -1,0 +1,106 @@
+{
+  "_comment": "Copy to config.json. Credentials are better set via env vars MT5_LOGIN / MT5_PASSWORD / MT5_SERVER. Leave login=0 to attach to the terminal that is already logged in.",
+  "mt5": {
+    "terminal_path": "",
+    "login": 0,
+    "password": "",
+    "server": "",
+    "timeout_ms": 60000,
+    "reconnect_attempts": 5,
+    "reconnect_base_delay_s": 2.0
+  },
+  "symbols": {
+    "gold": "XAUUSD",
+    "silver": "XAGUSD",
+    "eurusd": "EURUSD",
+    "dxy": "",
+    "_comment": "Base names; broker suffixes (XAUUSD.a, XAUUSDm) are auto-detected. Set dxy to your broker's USD index (DXY/USDX) or leave empty to use 1/EURUSD."
+  },
+  "strategy": {
+    "execution_timeframe": "M5",
+    "correlation_timeframe": "M15",
+    "buy_threshold": 60,
+    "sell_threshold": -60,
+    "weight_yield": 30,
+    "weight_dxy": 30,
+    "weight_silver": 30,
+    "weight_vwap": 10,
+    "yield_ticker": "^TNX",
+    "yield_trigger_bp": 2.0,
+    "yield_window_minutes": 15,
+    "yield_zscore_lookback": 60,
+    "yield_min_abs_zscore": 0.0,
+    "yield_refresh_seconds": 60,
+    "yield_max_staleness_minutes": 30,
+    "donchian_period": 20,
+    "breakout_lookback_bars": 3,
+    "correlation_window": 30,
+    "min_correlation": 0.6,
+    "usd_roc_bars": 4,
+    "usd_roc_min_pct": 0.03,
+    "block_on_divergence": true,
+    "atr_period": 14,
+    "vwap_retest_atr_mult": 1.0,
+    "require_vwap_retest": true
+  },
+  "news": {
+    "enabled": true,
+    "calendar_url": "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+    "currencies": [
+      "USD"
+    ],
+    "impacts": [
+      "High"
+    ],
+    "title_keywords": [],
+    "minutes_before": 30,
+    "minutes_after": 15,
+    "refresh_minutes": 60,
+    "max_cache_age_hours": 24,
+    "request_timeout_s": 10.0,
+    "cache_file": "data/calendar_cache.json",
+    "fail_closed": true,
+    "manage_open_positions": true,
+    "partial_close_fraction": 0.5,
+    "breakeven_buffer_points": 10,
+    "close_fully_if_unsplittable": true
+  },
+  "risk": {
+    "risk_per_trade": 0.01,
+    "sl_atr_mult": 1.5,
+    "tp_atr_mult": 3.0,
+    "max_daily_loss": 0.03,
+    "close_all_account_positions_on_halt": false,
+    "max_spread_points": 60,
+    "max_lot": 5.0,
+    "margin_usage_limit": 0.9
+  },
+  "execution": {
+    "dry_run": true,
+    "allow_live_trading": false,
+    "magic": 20260926,
+    "order_comment": "goldbot",
+    "deviation_points": 30,
+    "order_retries": 3,
+    "loop_interval_seconds": 10,
+    "max_open_positions": 1,
+    "cooldown_minutes": 15,
+    "session_filter_enabled": true,
+    "session_start_utc": "07:00",
+    "session_end_utc": "20:00",
+    "trade_weekdays": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "server_utc_offset_hours": null,
+    "market_stale_seconds": 300,
+    "_comment": "Start with dry_run=true, then false on DEMO. allow_live_trading must be true or the bot forces dry-run on a real account. trade_weekdays: 0=Mon..6=Sun."
+  },
+  "log_dir": "logs",
+  "log_level": "INFO",
+  "state_file": "data/state.json",
+  "journal_file": "logs/signal_journal.csv"
+}

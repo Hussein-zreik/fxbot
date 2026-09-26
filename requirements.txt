@@ -1,0 +1,6 @@
+# Runtime (Windows 64-bit, Python 3.10-3.12 recommended)
+MetaTrader5>=5.0.45; sys_platform == "win32"
+pandas>=2.0
+numpy>=1.24
+requests>=2.31
+yfinance>=0.2.40
