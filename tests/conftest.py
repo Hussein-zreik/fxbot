@@ -82,6 +82,14 @@ class FakeConnector:
         self.sent.append(("modify", pos.ticket, sl, tp))
         return OrderResult(ok=True)
 
+    deals: list = []
+
+    def deal_history(self, since):
+        return [d for d in self.deals if d.time >= since]
+
+    def position_deals(self, position_id):
+        return [d for d in self.deals if d.position_id == position_id]
+
     def close_position(self, pos, volume=None):
         self.sent.append(("close", pos.ticket, volume or pos.volume))
         return OrderResult(ok=True)

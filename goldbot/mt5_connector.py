@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -82,6 +82,28 @@ class PositionInfo:
     tp: float
     profit: float
     magic: int
+
+
+@dataclass
+class DealInfo:
+    """One executed deal from the account history (times in UTC)."""
+    ticket: int
+    position_id: int
+    time: datetime
+    side: str            # BUY / SELL (the deal's own direction)
+    entry: str           # IN / OUT / INOUT / OUT_BY
+    volume: float
+    price: float
+    profit: float        # net: profit + commission + swap + fee
+    reason: str          # SL / TP / STOP_OUT / BOT / MANUAL
+    magic: int
+    symbol: str
+    comment: str
+
+
+_DEAL_ENTRY = {0: "IN", 1: "OUT", 2: "INOUT", 3: "OUT_BY"}
+_DEAL_REASON = {0: "MANUAL", 1: "MANUAL", 2: "MANUAL", 3: "BOT", 4: "SL", 5: "TP",
+                6: "STOP_OUT"}
 
 
 @dataclass
@@ -350,6 +372,45 @@ class MT5Connector:
         except Exception as exc:  # noqa: BLE001
             log.warning("order_calc_margin raised: %s", exc)
             return None
+
+    # ------------------------------------------------------------------ #
+    # Account history
+    # ------------------------------------------------------------------ #
+    def _to_deals(self, raw) -> List[DealInfo]:
+        out = []
+        for d in raw or []:
+            if d.type not in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL):
+                continue  # balance, credit, commission rows etc.
+            out.append(DealInfo(
+                ticket=d.ticket, position_id=d.position_id,
+                time=datetime.fromtimestamp(d.time - self.utc_offset_seconds, timezone.utc),
+                side=BUY if d.type == mt5.DEAL_TYPE_BUY else SELL,
+                entry=_DEAL_ENTRY.get(d.entry, str(d.entry)),
+                volume=d.volume, price=d.price,
+                profit=d.profit + d.commission + d.swap + getattr(d, "fee", 0.0),
+                reason=_DEAL_REASON.get(d.reason, "OTHER"),
+                magic=d.magic, symbol=d.symbol, comment=d.comment,
+            ))
+        return out
+
+    def deal_history(self, since: datetime) -> List[DealInfo]:
+        """All trade deals since ``since`` (UTC); padded for broker time zones."""
+        start = since - timedelta(days=1)
+        end = datetime.now(timezone.utc) + timedelta(days=2)
+        try:
+            raw = mt5.history_deals_get(start, end)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("history_deals_get failed: %s", exc)
+            return []
+        return [d for d in self._to_deals(raw) if d.time >= since]
+
+    def position_deals(self, position_id: int) -> List[DealInfo]:
+        try:
+            raw = mt5.history_deals_get(position=position_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("history_deals_get(position) failed: %s", exc)
+            return []
+        return self._to_deals(raw)
 
     # ------------------------------------------------------------------ #
     # Trading (every method honours dry-run)

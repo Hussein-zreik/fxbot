@@ -13,6 +13,7 @@ from goldbot.dashboard import DashboardServer
 from goldbot.macro_engine import MacroDataEngine
 from goldbot.mt5_connector import MT5Connector
 from goldbot.news_filter import NewsFilterEngine
+from goldbot.notifier import TelegramNotifier
 from goldbot.orchestrator import BotOrchestrator
 from goldbot.risk_manager import RiskManager
 from goldbot.sentiment_engine import SentimentEngine
@@ -42,8 +43,9 @@ def build_bot(cfg: AppConfig) -> BotOrchestrator:
     news = NewsFilterEngine(cfg.news)
     risk = RiskManager(cfg.risk, connector, state)
     sentiment = SentimentEngine(cfg.ai_news)
+    notifier = TelegramNotifier(cfg.alerts)
     return BotOrchestrator(cfg, connector, macro, news, risk, state,
-                           sentiment=sentiment)
+                           sentiment=sentiment, notifier=notifier)
 
 
 def main() -> int:

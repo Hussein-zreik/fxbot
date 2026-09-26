@@ -17,6 +17,9 @@ class FakeBot:
     def status(self):
         return {"mode": "DRY-RUN", "positions": [], "events": []}
 
+    def performance(self):
+        return {"ready": True, "periods": {}}
+
     def submit_command(self, action):
         if action not in ("pause", "resume", "close_all"):
             raise ValueError("unknown command")
@@ -111,3 +114,10 @@ def test_close_all_can_be_disabled():
 def test_refuses_to_start_without_strong_token():
     assert not DashboardServer(DashboardConfig(port=0), FakeBot(), token="").start()
     assert not DashboardServer(DashboardConfig(port=0), FakeBot(), token="short").start()
+
+
+def test_performance_requires_token(server):
+    srv, _ = server
+    assert call(srv, "/api/performance", token=None)[0] == 401
+    code, _, body = call(srv, "/api/performance")
+    assert code == 200 and json.loads(body)["ready"] is True

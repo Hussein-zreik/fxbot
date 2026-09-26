@@ -90,13 +90,15 @@ goldbot/
   technical_engine.py      TechnicalEngine – session VWAP (00:00 UTC anchor), ATR
   trend_engine.py          TrendEngine – H4/H1 EMA50/200, ADX, swing structure, trend filter
   sentiment_engine.py      SentimentEngine – RSS headlines scored by an AI model (Groq), shock detector
-  dashboard.py / .html     Phone dashboard – token-protected web page + JSON API (stdlib only)
+  dashboard.py / .html     Phone dashboard – Live + Performance tabs, token-protected (stdlib only)
+  notifier.py              TelegramNotifier – push alerts + daily/weekly summaries
+  performance.py           Rebuilds closed trades from MT5 history; win rate, P/L, drawdown, signal attribution
   signal_model.py          score combination and entry decision
   risk_manager.py          RiskManager – sizing, SL/TP, daily guardrail
   orchestrator.py          BotOrchestrator – 10-second main loop, news management, journal
   indicators.py            pure indicator functions
   state.py                 crash-safe persistent state (data/state.json)
-tests/                     84 tests using a fake MT5 connector (run anywhere)
+tests/                     104 tests using a fake MT5 connector (run anywhere)
 ```
 
 ---
@@ -243,6 +245,39 @@ No firewall ports are opened.
     - **Close all** closes every bot position at market and also pauses. You must type `CLOSE` to confirm.
     - Commands run within about 10 seconds.
     - To remove the buttons, set `dashboard.allow_controls` / `dashboard.allow_close_all` to `false`.
+    - The **Performance** tab has 7D / 30D / All views:
+      - net profit, win rate, profit factor, average win/loss and max drawdown
+      - a cumulative-profit chart (tap it to see each trade)
+      - a **"Which signals worked"** table: for each signal, how the trades went when it agreed with the trade, compared with the rest
+      - results by direction and exit type, and your recent trades
+
+      Statistics come from MT5's own trade history, so they cover demo and live trading. In dry-run, nothing is executed, so the tab stays empty.
+
+### G. Telegram alerts (free)
+30. In Telegram, message **@BotFather** → `/newbot` → pick a name → copy the **token** it gives you.
+31. Open your new bot in Telegram and send it any message (e.g. "hi").
+32. On the VPS:
+    ```bat
+    setx TELEGRAM_BOT_TOKEN "123456:ABC-your-token"
+    ```
+    Open a **new** terminal, then run:
+    ```bat
+    python -m goldbot.notifier --setup
+    ```
+    It finds your chat ID, prints a `setx TELEGRAM_CHAT_ID ...` line for you to run, and sends a test message.
+33. Restart the bot. You'll receive:
+
+    | Category | Example |
+    |---|---|
+    | `trade` | ✅ Opened BUY 0.16 … (score +70) · 🟢 Closed BUY 0.16 #123: +88.00 USD (take profit, 45 min) · trend exits |
+    | `risk` | 🛑 DAILY LOSS LIMIT … closing all bot trades |
+    | `shock` | ⚡ AI SHOCK – new trades paused until 14:30 UTC: *headline* |
+    | `news` | 🛡 News NFP: protected #123 |
+    | `control` | Paused / resumed / closed from the dashboard |
+    | `system` | Bot started/stopped, MT5 connection lost/restored |
+    | `summary` | 📊 Daily summary at 21:05 UTC (Mon–Fri) and 📈 weekly summary on Friday |
+
+    To mute a category, remove it from `alerts.categories`. Messages are plain text, so a headline can't inject links or formatting. Identical messages within 60 s are sent only once.
 
 ---
 
@@ -268,6 +303,9 @@ No firewall ports are opened.
 | `ai_news.shock_pause_minutes` | `60` | Length of the shock pause |
 | `trend.exit_on_reversal` | `true` | Close trades when the H1 trend flips against them |
 | `dashboard.port` | `8765` | Local port for the phone dashboard |
+| `alerts.categories` | all 7 | Which Telegram alerts you get |
+| `alerts.daily_summary_utc` | `"21:05"` | Daily report time (`""` disables) |
+| `alerts.weekly_summary_weekday` | `4` (Friday) | Weekly report day (`-1` disables) |
 | `dashboard.allow_close_all` | `true` | Show the Close-all button |
 | `strategy.yield_trigger_bp` | `2.0` | Basis points in 15 min |
 | `strategy.min_correlation` | `0.6` | Gold/silver return correlation needed for confluence |
@@ -299,6 +337,6 @@ No firewall ports are opened.
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q        # 84 tests, no MT5 needed
+python -m pytest -q        # 104 tests, no MT5 needed
 python -m flake8 --max-line-length 100 goldbot run_bot.py tests
 ```

@@ -129,6 +129,30 @@ class SentimentConfig:
 
 
 @dataclass
+class AlertsConfig:
+    """Telegram push alerts. Secrets come from environment variables."""
+    enabled: bool = True
+    token_env: str = "TELEGRAM_BOT_TOKEN"
+    chat_id_env: str = "TELEGRAM_CHAT_ID"
+    prefix: str = "🟡 GoldBot |"
+    # trade: opened/closed/trend exits · risk: daily limit · shock: AI shock pause
+    # news: pre-news protection · control: dashboard commands
+    # system: start/stop/connection · summary: daily + weekly reports
+    categories: List[str] = field(default_factory=lambda: [
+        "trade", "risk", "shock", "news", "control", "system", "summary"])
+    dedupe_seconds: int = 60
+    daily_summary_utc: str = "21:05"   # after the NY close; "" disables
+    weekly_summary_weekday: int = 4    # 4 = Friday; -1 disables
+
+
+@dataclass
+class PerformanceConfig:
+    lookback_days: int = 365
+    refresh_minutes: int = 5
+    recent_trades: int = 20
+
+
+@dataclass
 class DashboardConfig:
     """Phone dashboard (served locally; reach it privately through Tailscale)."""
     enabled: bool = True
@@ -199,6 +223,8 @@ class AppConfig:
     trend: TrendConfig = field(default_factory=TrendConfig)
     ai_news: SentimentConfig = field(default_factory=SentimentConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
+    alerts: AlertsConfig = field(default_factory=AlertsConfig)
+    performance: PerformanceConfig = field(default_factory=PerformanceConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     log_dir: str = "logs"

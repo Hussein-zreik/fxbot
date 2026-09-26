@@ -32,6 +32,8 @@ from .correlation_engine import CorrelationEngine, CorrelationSnapshot
 from .macro_engine import MacroDataEngine, YieldSnapshot
 from .mt5_connector import BUY, PositionInfo
 from .news_filter import NewsFilterEngine, NewsState
+from .notifier import TelegramNotifier
+from .performance import build_trades, compute_stats, json_safe, summary_text
 from .risk_manager import RiskManager, round_volume_down
 from .sentiment_engine import SentimentEngine, SentimentSnapshot
 from .signal_model import Signal, build_signal
@@ -73,7 +75,8 @@ class BotOrchestrator:
     def __init__(self, cfg: AppConfig, connector, macro: MacroDataEngine,
                  news: NewsFilterEngine, risk: RiskManager, state: StateStore,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-                 sentiment: Optional[SentimentEngine] = None):
+                 sentiment: Optional[SentimentEngine] = None,
+                 notifier: Optional[TelegramNotifier] = None):
         self.cfg = cfg
         self.connector = connector
         self.macro = macro
@@ -98,6 +101,14 @@ class BotOrchestrator:
         self._status: Dict[str, Any] = {"state": "starting"}
         self._last_bar_report: Dict[str, Any] = {}
         self._events: deque = deque(maxlen=30)
+
+        # Alerts and performance.
+        self.notifier = notifier
+        self._was_connected = True
+        self._perf: Dict[str, Any] = {}
+        self._perf_trades: list = []
+        self._perf_at: Optional[datetime] = None
+        self._currency = ""
 
     # ----------------------------------------------------------------- #
     # Lifecycle
@@ -126,6 +137,10 @@ class BotOrchestrator:
         self.macro.start()
         if self.sentiment:
             self.sentiment.start()
+        if self.notifier:
+            self.notifier.start()
+        self._event(f"Bot started on {self.gold} "
+                    f"({'DRY-RUN' if self.connector.dry_run else 'trading'})", "system")
         interval = self.cfg.execution.loop_interval_seconds
         log.info("Main loop started (every %ss). Ctrl+C to stop.", interval)
         try:
@@ -147,6 +162,9 @@ class BotOrchestrator:
             self.sentiment.stop()
         self.connector.shutdown()
         log.info("Bot stopped. Open positions keep their broker-side SL/TP.")
+        if self.notifier:
+            self.notifier.send("Bot stopped. Open trades keep their SL/TP.", "system")
+            self.notifier.stop()
 
     # ----------------------------------------------------------------- #
     # Dashboard interface (called from the web server thread)
@@ -162,8 +180,14 @@ class BotOrchestrator:
         with self._status_lock:
             return dict(self._status)
 
-    def _event(self, text: str) -> None:
+    def _event(self, text: str, category: Optional[str] = None) -> None:
+        """Record an activity-feed entry and, if categorised, push an alert."""
         self._events.appendleft({"time": self._clock().isoformat(), "text": text})
+        if category and self.notifier:
+            self.notifier.send(text, category)
+
+    def performance(self) -> Dict[str, Any]:
+        return self._perf or {"ready": False}
 
     @property
     def paused(self) -> bool:
@@ -178,16 +202,16 @@ class BotOrchestrator:
             if action == "pause":
                 self.state.set("paused", True)
                 log.warning("Dashboard: new entries PAUSED")
-                self._event("Paused new trades (dashboard)")
+                self._event("Paused new trades (dashboard)", "control")
             elif action == "resume":
                 self.state.set("paused", False)
                 log.warning("Dashboard: trading RESUMED")
-                self._event("Resumed trading (dashboard)")
+                self._event("Resumed trading (dashboard)", "control")
             elif action == "close_all":
                 # Pause too, or the next signal could immediately re-enter.
                 self.state.set("paused", True)
                 closed = self._close_bot_positions("dashboard close-all")
-                self._event(f"Closed {closed} position(s) and paused (dashboard)")
+                self._event(f"Closed {closed} position(s) and paused (dashboard)", "control")
 
     # ----------------------------------------------------------------- #
     # One loop iteration
@@ -202,7 +226,13 @@ class BotOrchestrator:
     def _step(self, ctx: Dict[str, Any]) -> None:
         if not self.connector.ensure_connected():
             log.error("MT5 unavailable; will retry next loop")
+            if self._was_connected:
+                self._event("⚠ Lost connection to MT5 - retrying", "system")
+                self._was_connected = False
             return
+        if not self._was_connected:
+            self._event("MT5 connection restored", "system")
+            self._was_connected = True
         ctx["connected"] = True
         self._process_commands()
 
@@ -210,6 +240,7 @@ class BotOrchestrator:
         if acc is None:
             return
         ctx["account"] = acc
+        self._currency = acc.currency
 
         magic = self.cfg.execution.magic
         positions = self.connector.positions(self.gold, magic)
@@ -218,10 +249,20 @@ class BotOrchestrator:
 
         guard = self.risk.update_daily(acc)
         ctx["guard"] = guard
+        if guard.just_triggered:
+            self._event(f"🛑 DAILY LOSS LIMIT: {guard.reason}. Closing all bot trades.", "risk")
         self.news.refresh()
         news_state = self.news.state()
         ai = self.sentiment.snapshot() if self.sentiment else SentimentSnapshot()
         ctx["news"], ctx["ai"] = news_state, ai
+        if ai.shock_active and self.state.get("shock_alerted") != ai.shock_headline:
+            self.state.set("shock_alerted", ai.shock_headline)
+            until = ai.shock_until.strftime("%H:%M") if ai.shock_until else "?"
+            self._event(f"⚡ AI SHOCK - new trades paused until {until} UTC: "
+                        f"{ai.shock_headline}", "shock")
+
+        self._refresh_performance()
+        self._maybe_send_summaries(acc)
 
         if guard.halted:
             self._flatten(guard.reason)
@@ -325,10 +366,13 @@ class BotOrchestrator:
                 f"risk {plan.risk_amount:.2f} {acc.currency}")
         if result.ok:
             log.info("ORDER %s%s", "[DRY-RUN] " if result.dry_run else "", desc)
-            self._event(("DRY-RUN " if result.dry_run else "Opened ") + desc)
+            if not result.dry_run and result.ticket:
+                self._remember_trade(result.ticket, sig)
+            self._event(("DRY-RUN " if result.dry_run else "✅ Opened ") + desc +
+                        f" (score {sig.total:+d})", "trade")
             return ("DRY-RUN " if result.dry_run else "OPENED ") + desc
         log.error("ORDER FAILED %s -> retcode %s %s", desc, result.retcode, result.message)
-        self._event(f"Order FAILED: {desc} ({result.retcode})")
+        self._event(f"❌ Order FAILED: {desc} ({result.retcode} {result.message})", "trade")
         return f"FAILED {desc}: {result.retcode} {result.message}"
 
     # ----------------------------------------------------------------- #
@@ -340,9 +384,86 @@ class BotOrchestrator:
             closed = self._prev_tickets - tickets
             log.info("Position(s) closed: %s - cooldown %d min", sorted(closed),
                      self.cfg.execution.cooldown_minutes)
-            self._event(f"Position(s) closed: {', '.join(map(str, sorted(closed)))}")
+            for ticket in sorted(closed):
+                self._event(self._close_message(ticket), "trade")
             self.state.set("last_exit_time", self._clock().isoformat())
+            self._perf_at = None  # refresh stats now
         self._prev_tickets = tickets
+
+    def _remember_trade(self, ticket: int, sig: Signal) -> None:
+        """Store the entry score breakdown so performance can attribute it."""
+        meta = self.state.get("trade_meta", {})
+        meta[str(ticket)] = {"total": sig.total, "parts": {
+            "yield": sig.yield_score, "dollar": sig.dxy_score, "silver": sig.silver_score,
+            "trend": sig.trend_score, "ai_news": sig.news_score, "vwap": sig.vwap_score}}
+        if len(meta) > 1000:  # keep the state file small
+            meta = dict(list(meta.items())[-1000:])
+        self.state.set("trade_meta", meta)
+
+    def _close_message(self, ticket: int) -> str:
+        deals = self.connector.position_deals(ticket)
+        trades = build_trades(deals, self.cfg.execution.magic)
+        if not trades:
+            return f"Position #{ticket} closed"
+        t = trades[0]
+        icon = "🟢" if t.profit > 0 else "🔴"
+        why = {"TP": "take profit", "SL": "stop loss", "BOT": "closed by bot",
+               "MANUAL": "closed manually", "STOP_OUT": "STOP OUT"}.get(t.exit_reason,
+                                                                        t.exit_reason)
+        return (f"{icon} Closed {t.side} {t.volume} #{ticket}: {t.profit:+.2f} "
+                f"{self._currency} ({why}, {t.hold_minutes:.0f} min)")
+
+    # ----------------------------------------------------------------- #
+    # Performance and summaries
+    # ----------------------------------------------------------------- #
+    def _refresh_performance(self) -> None:
+        pcfg = self.cfg.performance
+        now = self._clock()
+        if self._perf_at and now - self._perf_at < timedelta(minutes=pcfg.refresh_minutes):
+            return
+        self._perf_at = now
+        try:
+            deals = self.connector.deal_history(now - timedelta(days=pcfg.lookback_days))
+            trades = build_trades(deals, self.cfg.execution.magic,
+                                  self.state.get("trade_meta", {}))
+        except Exception:  # noqa: BLE001 - stats must never break trading
+            log.exception("Performance refresh failed")
+            return
+        self._perf_trades = trades
+        self._perf = json_safe({
+            "ready": True,
+            "updated": now.isoformat(),
+            "currency": self._currency,
+            "dry_run": self.connector.dry_run,
+            "periods": {"7d": compute_stats(trades, now, 7),
+                        "30d": compute_stats(trades, now, 30),
+                        "all": compute_stats(trades, now, None)},
+            "recent": [t.to_json() for t in trades[-pcfg.recent_trades:][::-1]],
+        })
+
+    def _maybe_send_summaries(self, acc) -> None:
+        acfg = self.cfg.alerts
+        if not self.notifier or not acfg.daily_summary_utc:
+            return
+        now = self._clock()
+        if now.weekday() > 4 or now.time() < _parse_hhmm(acfg.daily_summary_utc):
+            return
+        today = now.date().isoformat()
+        if self.state.get("last_daily_summary") == today:
+            return
+        self.state.set("last_daily_summary", today)
+        self._perf_at = None
+        self._refresh_performance()
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        todays = [t for t in self._perf_trades if t.close_time >= start]
+        stats = compute_stats(todays, now, None)
+        text = summary_text(stats, f"📊 Daily summary {today}", acc.currency)
+        text += f"\nEquity: {acc.equity:,.2f} {acc.currency}"
+        self._event(text, "summary")
+        if now.weekday() == acfg.weekly_summary_weekday:
+            week = compute_stats(self._perf_trades, now, 7)
+            self._event(summary_text(week, "📈 Weekly summary (last 7 days)", acc.currency),
+                        "summary")
 
     def _close_bot_positions(self, reason: str) -> int:
         closed = 0
@@ -364,7 +485,7 @@ class BotOrchestrator:
                         pos.side, pos.volume, "ok" if res.ok else res.message)
         if targets:
             log.warning("Trading halted: %s", reason)
-            self._event(f"Guardrail closed {len(targets)} position(s): {reason}")
+            self._event(f"Guardrail closed {len(targets)} position(s): {reason}", "risk")
 
     def _trend_exits(self, positions: List[PositionInfo], trend: TrendSnapshot) -> None:
         """Close trades whose exit-timeframe trend has flipped against them."""
@@ -379,7 +500,7 @@ class BotOrchestrator:
                 msg = (f"Trend exit: {tf} turned {'DOWN' if side > 0 else 'UP'} - "
                        f"closed {pos.side} #{pos.ticket}")
                 log.warning("%s (%s)", msg, "ok" if res.ok else res.message)
-                self._event(msg)
+                self._event(msg, "trade")
 
     def _protect_all(self, positions: List[PositionInfo], title: str, state_key: str,
                      window: timedelta) -> None:
@@ -396,7 +517,8 @@ class BotOrchestrator:
                 continue
             if self._protect_position(pos, spec, tick, title):
                 handled[key] = now.isoformat()
-                self._event(f"{title}: protected #{pos.ticket}")
+                self._event(f"🛡 {title}: protected #{pos.ticket}",
+                            "shock" if state_key == "shock_handled" else "news")
         live = {str(p.ticket) for p in positions}
         self.state.set(state_key, {k: v for k, v in handled.items() if k in live})
 

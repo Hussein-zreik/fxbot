@@ -12,7 +12,7 @@
 <style nonce="{{NONCE}}">
 :root {
   --bg: #f4f5f7; --card: #ffffff; --text: #16181d; --muted: #6b7280;
-  --line: #e5e7eb; --track: #eceef1; --gold: #b7862b;
+  --line: #e5e7eb; --track: #eceef1; --gold: #b7862b; --series: #b7862b; --grid: #e5e7eb;
   --up: #15803d; --up-bg: #dcfce7; --down: #b91c1c; --down-bg: #fee2e2;
   --warn: #a16207; --warn-bg: #fef3c7; --info: #1d4ed8; --info-bg: #dbeafe;
   --shadow: 0 1px 2px rgba(0,0,0,.06), 0 1px 8px rgba(0,0,0,.04);
@@ -20,7 +20,7 @@
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #0d0f13; --card: #171a21; --text: #eef0f4; --muted: #9aa3b2;
-    --line: #262a33; --track: #232733; --gold: #e0b252;
+    --line: #262a33; --track: #232733; --gold: #e0b252; --series: #b8862e; --grid: #2a2f3a;
     --up: #4ade80; --up-bg: #0f2e1b; --down: #f87171; --down-bg: #3a1414;
     --warn: #fbbf24; --warn-bg: #3a2c0a; --info: #93c5fd; --info-bg: #13233f;
     --shadow: none;
@@ -76,6 +76,7 @@ h2 { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacin
 .part .val { text-align: right; font-weight: 600; }
 .action { margin-top: 10px; font-size: 13px; color: var(--muted); word-break: break-word; }
 .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+#exitChips { margin-top: 12px; }
 .chip { padding: 6px 10px; border-radius: 10px; font-weight: 600; font-size: 14px;
   background: var(--track); }
 .chip.up { background: var(--up-bg); color: var(--up); }
@@ -101,6 +102,35 @@ input { font: inherit; width: 100%; padding: 12px; border-radius: 12px; border: 
   background: var(--bg); color: var(--text); margin: 8px 0 12px; }
 .linkish { background: none; padding: 6px 0; color: var(--muted); font-weight: 400; font-size: 13px; }
 .note { margin-top: 8px; }
+.tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; background: var(--track);
+  padding: 4px; border-radius: 12px; margin-bottom: 12px; }
+.tabs button, .seg button { padding: 9px 8px; border-radius: 9px; background: transparent;
+  color: var(--muted); font-size: 14px; }
+.tabs button.on, .seg button.on { background: var(--card); color: var(--text); box-shadow: var(--shadow); }
+.seg { display: inline-grid; grid-template-columns: repeat(3, auto); gap: 2px; background: var(--track);
+  padding: 3px; border-radius: 10px; }
+.seg button { padding: 6px 14px; font-size: 13px; }
+.kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px 8px; }
+.kpi .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+.kpi .v { font-size: 19px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.hero { display: flex; justify-content: space-between; align-items: flex-end; gap: 8px;
+  flex-wrap: wrap; margin-bottom: 14px; }
+.hero .big { white-space: nowrap; }
+.unit { font-size: 15px; font-weight: 600; color: var(--muted); }
+.chart { position: relative; margin-top: 4px; touch-action: pan-y; }
+.chart svg { display: block; width: 100%; height: 190px; overflow: visible; }
+.chart .tip { position: absolute; top: 0; pointer-events: none; background: var(--text); color: var(--bg);
+  border-radius: 8px; padding: 6px 8px; font-size: 12px; white-space: nowrap; transform: translateX(-50%);
+  opacity: 0; transition: opacity .12s; }
+.chart .tip.on { opacity: 1; }
+.chart .tip b { font-variant-numeric: tabular-nums; }
+table.t { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+table.t th { text-align: right; font-weight: 600; color: var(--muted); font-size: 11px; text-transform: uppercase;
+  letter-spacing: .04em; padding: 0 0 6px; }
+table.t th:first-child, table.t td:first-child { text-align: left; }
+table.t td { text-align: right; padding: 7px 0; border-top: 1px solid var(--line); }
+.hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+.empty { text-align: center; padding: 28px 8px; color: var(--muted); }
 .toast { position: fixed; left: 16px; right: 16px; bottom: calc(env(safe-area-inset-bottom) + 16px);
   max-width: 528px; margin: 0 auto; background: var(--text); color: var(--bg); padding: 12px 14px;
   border-radius: 12px; font-size: 14px; opacity: 0; transition: opacity .25s; pointer-events: none; }
@@ -120,6 +150,54 @@ input { font: inherit; width: 100%; padding: 12px; border-radius: 12px; border: 
   <input id="tokenInput" type="password" autocomplete="current-password" placeholder="Dashboard token">
   <button class="primary" id="saveToken">Connect</button>
 </section>
+
+<nav class="tabs hidden" id="tabs">
+  <button class="on" id="tabLive">Live</button>
+  <button id="tabPerf">Performance</button>
+</nav>
+
+<main id="perf" class="hidden">
+  <div class="card">
+    <div class="hero">
+      <div><h2>Net profit</h2><div class="big num" id="pNet">–</div></div>
+      <div class="seg" id="period">
+        <button data-p="7d" class="on">7D</button><button data-p="30d">30D</button><button data-p="all">All</button>
+      </div>
+    </div>
+    <div class="kpis">
+      <div class="kpi"><div class="k">Trades</div><div class="v" id="pTrades">–</div></div>
+      <div class="kpi"><div class="k">Win rate</div><div class="v" id="pWin">–</div></div>
+      <div class="kpi"><div class="k">Profit factor</div><div class="v" id="pPF">–</div></div>
+      <div class="kpi"><div class="k">Avg win</div><div class="v" id="pAvgW">–</div></div>
+      <div class="kpi"><div class="k">Avg loss</div><div class="v" id="pAvgL">–</div></div>
+      <div class="kpi"><div class="k">Max drawdown</div><div class="v" id="pDD">–</div></div>
+    </div>
+  </div>
+
+  <section class="card">
+    <h2>Cumulative profit</h2>
+    <div class="chart" id="chart"></div>
+    <div class="hint" id="chartHint">Touch the chart to see each trade.</div>
+  </section>
+
+  <section class="card">
+    <h2>Which signals worked</h2>
+    <table class="t" id="sigTable"></table>
+    <div class="hint">"Agreed" = the signal pointed the same way as the trade. A signal is
+      earning its weight when its "agreed" trades beat the rest. Needs 20+ trades to mean much.</div>
+  </section>
+
+  <section class="card">
+    <h2>By direction &amp; exit</h2>
+    <table class="t" id="sideTable"></table>
+    <div class="chips" id="exitChips"></div>
+  </section>
+
+  <section class="card">
+    <h2>Recent trades</h2>
+    <ul class="list" id="recent"></ul>
+  </section>
+</main>
 
 <main id="app" class="hidden">
   <div class="banner red hidden" id="bannerShock"></div>
@@ -397,19 +475,221 @@ input { font: inherit; width: 100%; padding: 12px; border-radius: 12px; border: 
     });
   }
 
+  // ------------------------------------------------------------------ performance
+  var SVG = "http://www.w3.org/2000/svg";
+  var perf = null, period = "7d", tab = "live";
+  var BLOCK_LABELS = { yield: "Yields", dollar: "Dollar", silver: "Silver", trend: "Trend",
+                       ai_news: "AI news", vwap: "VWAP" };
+  var EXIT_LABELS = { TP: "Take profit", SL: "Stop loss", BOT: "Bot exit", MANUAL: "Manual",
+                      STOP_OUT: "Stop out" };
+
+  function svg(tag, attrs) {
+    var n = document.createElementNS(SVG, tag);
+    Object.keys(attrs || {}).forEach(function (k) {
+      var v = String(attrs[k]);
+      // Theme colours go through CSSOM: var() is not valid in SVG attributes everywhere.
+      if (v.indexOf("var(") === 0) n.style.setProperty(k, v); else n.setAttribute(k, v);
+    });
+    return n;
+  }
+  function cur() { return (perf && perf.currency) || ""; }
+  function pct(v) { return v === null || v === undefined ? "–" : Math.round(v) + "%"; }
+  function colorNum(node, v) { node.className = node.className.replace(/ ?(pos|neg)/g, "") +
+    (v > 0 ? " pos" : v < 0 ? " neg" : ""); }
+
+  function loadPerf() {
+    api("/api/performance").then(function (p) { perf = p; renderPerf(); })
+      .catch(function (err) { if (err && err.auth) logout("Token rejected - please re-enter it."); });
+  }
+
+  function niceTicks(min, max, n) {
+    var span = max - min || 1, step = Math.pow(10, Math.floor(Math.log10(span / n)));
+    [1, 2, 5, 10].some(function (m) { if (span / (step * m) <= n) { step *= m; return true; } return false; });
+    var ticks = [];
+    for (var v = Math.floor(min / step) * step; v <= max + 1e-9; v += step) ticks.push(v);
+    return ticks;
+  }
+
+  function drawChart(curve) {
+    var box = $("chart"); clear(box);
+    if (!curve.length) { box.appendChild(el("div", "empty", "No closed trades in this period")); return; }
+    var pts = [{ t: null, v: 0 }].concat(curve);
+    var W = box.clientWidth || 340, H = 190, L = 44, R = 8, T = 10, B = 22;
+    var vals = pts.map(function (p) { return p.v; });
+    var ticks = niceTicks(Math.min(0, Math.min.apply(null, vals)), Math.max(0, Math.max.apply(null, vals)), 4);
+    var lo = ticks[0], hi = ticks[ticks.length - 1];
+    function x(i) { return L + (pts.length === 1 ? 0 : i * (W - L - R) / (pts.length - 1)); }
+    function y(v) { return T + (hi - v) * (H - T - B) / ((hi - lo) || 1); }
+
+    var s = svg("svg", { viewBox: "0 0 " + W + " " + H, role: "img",
+      "aria-label": "Cumulative profit after each closed trade" });
+    ticks.forEach(function (tv) {
+      s.appendChild(svg("line", { x1: L, x2: W - R, y1: y(tv), y2: y(tv),
+        stroke: tv === 0 ? "var(--muted)" : "var(--grid)", "stroke-width": 1,
+        "stroke-dasharray": tv === 0 ? "3 3" : "" }));
+      var lab = svg("text", { x: L - 6, y: y(tv) + 4, "text-anchor": "end", "font-size": 11,
+        fill: "var(--muted)" });
+      lab.textContent = Math.round(tv).toLocaleString();
+      s.appendChild(lab);
+    });
+    var d = pts.map(function (p, i) { return (i ? "L" : "M") + x(i).toFixed(1) + " " + y(p.v).toFixed(1); }).join(" ");
+    s.appendChild(svg("path", { d: d, fill: "none", stroke: "var(--series)", "stroke-width": 2,
+      "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    var lastI = pts.length - 1;
+    s.appendChild(svg("circle", { cx: x(lastI), cy: y(pts[lastI].v), r: 4, fill: "var(--series)",
+      stroke: "var(--card)", "stroke-width": 2 }));
+    var axisL = svg("text", { x: L, y: H - 4, "font-size": 11, fill: "var(--muted)" });
+    axisL.textContent = "start";
+    s.appendChild(axisL);
+    var axisR = svg("text", { x: W - R, y: H - 4, "text-anchor": "end", "font-size": 11, fill: "var(--muted)" });
+    axisR.textContent = "trade " + curve.length;
+    s.appendChild(axisR);
+
+    // Hover / touch layer: crosshair + tooltip snapped to the nearest trade.
+    var cross = svg("line", { y1: T, y2: H - B, stroke: "var(--muted)", "stroke-width": 1, opacity: 0 });
+    var dot = svg("circle", { r: 5, fill: "var(--series)", stroke: "var(--card)", "stroke-width": 2, opacity: 0 });
+    s.appendChild(cross); s.appendChild(dot);
+    var hit = svg("rect", { x: L, y: 0, width: W - L - R, height: H, fill: "transparent" });
+    s.appendChild(hit);
+    box.appendChild(s);
+    var tip = el("div", "tip"); box.appendChild(tip);
+
+    function at(evt) {
+      var r = s.getBoundingClientRect();
+      var px = (evt.clientX - r.left) * (W / r.width);
+      var i = Math.max(1, Math.min(lastI, Math.round((px - L) / ((W - L - R) / (lastI || 1)))));
+      var p = pts[i], prev = pts[i - 1];
+      cross.setAttribute("x1", x(i)); cross.setAttribute("x2", x(i)); cross.setAttribute("opacity", 1);
+      dot.setAttribute("cx", x(i)); dot.setAttribute("cy", y(p.v)); dot.setAttribute("opacity", 1);
+      clear(tip);
+      tip.appendChild(el("div", "", "Trade " + i + " · " + new Date(p.t).toLocaleDateString([], { month: "short", day: "numeric" })));
+      var b = el("b", "", "Total " + signed(p.v, 2) + " " + cur());
+      tip.appendChild(b);
+      tip.appendChild(el("div", "", "This trade " + signed(p.v - prev.v, 2)));
+      tip.style.left = Math.max(60, Math.min(r.width - 60, x(i) * r.width / W)) + "px";
+      tip.classList.add("on");
+    }
+    function off() { tip.classList.remove("on"); cross.setAttribute("opacity", 0); dot.setAttribute("opacity", 0); }
+    hit.addEventListener("pointermove", at);
+    hit.addEventListener("pointerdown", at);
+    // Touch: keep the tooltip after the finger lifts (tap outside to dismiss).
+    hit.addEventListener("pointerleave", function (e) { if (e.pointerType === "mouse") off(); });
+    document.addEventListener("pointerdown", function (e) { if (!box.contains(e.target)) off(); });
+  }
+
+  function renderPerf() {
+    if (!perf || !perf.ready) {
+      $("pNet").textContent = "…"; clear($("recent"));
+      $("recent").appendChild(el("li", "sub", "Statistics load a few seconds after the bot connects."));
+      return;
+    }
+    var st = perf.periods[period];
+    clear($("pNet"));
+    $("pNet").appendChild(document.createTextNode(signed(st.net, 2)));
+    $("pNet").appendChild(el("span", "unit", " " + cur()));
+    colorNum($("pNet"), st.net);
+    $("pTrades").textContent = st.trades;
+    $("pWin").textContent = pct(st.win_rate);
+    $("pPF").textContent = st.profit_factor === null ? (st.wins ? "∞" : "–") : st.profit_factor.toFixed(2);
+    $("pAvgW").textContent = st.avg_win === null ? "–" : "+" + st.avg_win.toFixed(0);
+    $("pAvgL").textContent = st.avg_loss === null ? "–" : st.avg_loss.toFixed(0);
+    $("pDD").textContent = st.max_drawdown ? "−" + st.max_drawdown.toFixed(0) : "0";
+    drawChart(st.curve);
+    show($("chartHint"), st.curve.length > 0);
+
+    // Signals table
+    var t = $("sigTable"); clear(t);
+    var head = el("tr"); ["Signal", "Agreed", "Win", "Net", "Others"].forEach(function (h) { head.appendChild(el("th", "", h)); });
+    t.appendChild(head);
+    Object.keys(BLOCK_LABELS).forEach(function (k) {
+      var a = st.signals[k].agreed, o = st.signals[k].not_agreed, tr = el("tr");
+      tr.appendChild(el("td", "", BLOCK_LABELS[k]));
+      tr.appendChild(el("td", "", a.n));
+      tr.appendChild(el("td", "", pct(a.win_rate)));
+      var net = el("td", "", a.n ? signed(a.net, 0) : "–"); colorNum(net, a.net); tr.appendChild(net);
+      var on = el("td", "", o.n ? signed(o.net, 0) + " (" + o.n + ")" : "–"); colorNum(on, o.net); tr.appendChild(on);
+      t.appendChild(tr);
+    });
+
+    // Side table + exits
+    var st2 = $("sideTable"); clear(st2);
+    var h2 = el("tr"); ["Side", "Trades", "Win", "Net"].forEach(function (h) { h2.appendChild(el("th", "", h)); });
+    st2.appendChild(h2);
+    ["BUY", "SELL"].forEach(function (side) {
+      var b = st.by_side[side], tr = el("tr");
+      tr.appendChild(el("td", side === "BUY" ? "pos" : "neg", side));
+      tr.appendChild(el("td", "", b.n)); tr.appendChild(el("td", "", pct(b.win_rate)));
+      var n = el("td", "", b.n ? signed(b.net, 2) : "–"); colorNum(n, b.net); tr.appendChild(n);
+      st2.appendChild(tr);
+    });
+    var ex = $("exitChips"); clear(ex);
+    Object.keys(st.exits).forEach(function (k) {
+      ex.appendChild(el("span", "chip", (EXIT_LABELS[k] || k) + " " + st.exits[k]));
+    });
+
+    // Recent trades
+    var ul = $("recent"); clear(ul);
+    if (!perf.recent.length) ul.appendChild(el("li", "sub", perf.dry_run ?
+      "No trades yet - the bot is in DRY-RUN, so nothing is executed. Switch to the demo account to collect results." :
+      "No closed trades yet."));
+    perf.recent.forEach(function (tr) {
+      var li = el("li", "position"), top = el("div", "row");
+      top.appendChild(el("span", tr.side === "BUY" ? "pos" : "neg", tr.side + " " + tr.volume +
+        (tr.score !== null ? "  · score " + signed(tr.score) : "")));
+      var pl = el("span", "num", signed(tr.profit, 2) + " " + cur()); colorNum(pl, tr.profit);
+      top.appendChild(pl); li.appendChild(top);
+      var g = el("div", "grid3");
+      g.appendChild(el("span", "", new Date(tr.close_time).toLocaleDateString([], { month: "short", day: "numeric" }) +
+        " " + hhmm(tr.close_time)));
+      g.appendChild(el("span", "", EXIT_LABELS[tr.exit_reason] || tr.exit_reason));
+      g.appendChild(el("span", "", Math.round((new Date(tr.close_time) - new Date(tr.open_time)) / 60000) + " min"));
+      li.appendChild(g); ul.appendChild(li);
+    });
+  }
+
+  function setTab(which) {
+    tab = which;
+    $("tabLive").classList.toggle("on", which === "live");
+    $("tabPerf").classList.toggle("on", which === "perf");
+    show($("app"), which === "live"); show($("perf"), which === "perf");
+    if (which === "perf") loadPerf();
+  }
+  $("tabLive").addEventListener("click", function () { setTab("live"); });
+  $("tabPerf").addEventListener("click", function () { setTab("perf"); });
+  Array.prototype.forEach.call($("period").querySelectorAll("button"), function (b) {
+    b.addEventListener("click", function () {
+      period = b.getAttribute("data-p");
+      Array.prototype.forEach.call($("period").querySelectorAll("button"), function (o) {
+        o.classList.toggle("on", o === b);
+      });
+      renderPerf();
+    });
+  });
+  // Redraw only when the WIDTH changes: iOS fires resize as the toolbar collapses on scroll.
+  var lastW = window.innerWidth;
+  window.addEventListener("resize", function () {
+    if (window.innerWidth === lastW) return;
+    lastW = window.innerWidth;
+    if (tab === "perf") renderPerf();
+  });
+
   // ------------------------------------------------------------------ session
   function login() {
-    show($("login"), false); show($("app"), true);
+    show($("login"), false); show($("tabs"), true); setTab(tab);
     refresh();
     clearInterval(timer);
+    var ticks = 0;
     timer = setInterval(function () {
-      if (!document.hidden) refresh();
-      else if (last) $("updated").textContent = ago(last.updated);
+      ticks++;
+      if (!document.hidden) {
+        refresh();
+        if (tab === "perf" && ticks % 12 === 0) loadPerf();   // stats change slowly
+      } else if (last) $("updated").textContent = ago(last.updated);
     }, 5000);
   }
   function logout(msg) {
     clearInterval(timer); token = ""; storeSet("");
-    show($("app"), false); show($("login"), true);
+    show($("app"), false); show($("perf"), false); show($("tabs"), false); show($("login"), true);
     if (msg) toast(msg);
   }
 

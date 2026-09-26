@@ -2,6 +2,7 @@
 
 * ``GET  /``             the mobile dashboard page (static; holds no data)
 * ``GET  /api/status``   live bot snapshot as JSON            (token required)
+* ``GET  /api/performance`` trade statistics as JSON          (token required)
 * ``POST /api/command``  pause / resume / close_all            (token required)
 
 Security model
@@ -141,6 +142,10 @@ class DashboardServer:
                     if not self._authorized():
                         return self._json(401, {"error": "unauthorized"})
                     self._json(200, server.bot.status())
+                elif path == "/api/performance":
+                    if not self._authorized():
+                        return self._json(401, {"error": "unauthorized"})
+                    self._json(200, server.bot.performance())
                 else:
                     self._json(404, {"error": "not found"})
 

@@ -249,3 +249,109 @@ def test_ranging_h1_does_not_close_trade(tmp_path, account):
     conn.open_positions = [long_position(ticket=9)]
     bot.step()
     assert not [s for s in conn.sent if s[0] == "close"]
+
+
+# --------------------------------------------------------------------------- #
+# Telegram alerts and performance
+# --------------------------------------------------------------------------- #
+class Recorder:
+    active = True
+
+    def __init__(self):
+        self.msgs = []
+
+    def send(self, text, category):
+        self.msgs.append((category, text))
+        return True
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+
+def closed_deals(pid, profit, minutes_ago=30, now=NOW):
+    from goldbot.mt5_connector import DealInfo
+    t = now - timedelta(minutes=minutes_ago)
+    return [DealInfo(pid * 10, pid, t - timedelta(minutes=45), "BUY", "IN", 0.1, 2600,
+                     -0.7, "BOT", 20260926, "XAUUSD", "goldbot +70"),
+            DealInfo(pid * 10 + 1, pid, t, "SELL", "OUT", 0.1, 2610, profit + 0.7, "TP",
+                     0, "XAUUSD", "")]
+
+
+def test_trade_alerts_open_and_close(tmp_path, account):
+    bot, conn = build(tmp_path, account)
+    bot.notifier = rec = Recorder()
+    bot.step()
+    assert any(c == "trade" and "BUY" in t and "score +70" in t for c, t in rec.msgs)
+
+    conn.open_positions = [long_position(ticket=5)]
+    bot.step()
+    conn.open_positions = []
+    conn.deals = closed_deals(5, 88.0)
+    bot.step()
+    assert any(c == "trade" and "Closed BUY 0.1 #5: +88.00 USD (take profit" in t
+               for c, t in rec.msgs)
+
+
+def test_risk_and_shock_alerts_sent_once(tmp_path, account):
+    bot, conn = build(tmp_path, account)
+    bot.notifier = rec = Recorder()
+    bot.sentiment = ShockAI()
+    bot.step()
+    bot._last_bar = None
+    bot.step()
+    shocks = [t for c, t in rec.msgs if c == "shock" and "AI SHOCK" in t]
+    assert len(shocks) == 1 and "Emergency Fed meeting" in shocks[0]
+
+    conn.acc = replace(account, equity=9_600.0)
+    bot.step()
+    assert any(c == "risk" and "DAILY LOSS LIMIT" in t for c, t in rec.msgs)
+
+
+def test_connection_lost_and_restored_alerts(tmp_path, account):
+    bot, conn = build(tmp_path, account)
+    bot.notifier = rec = Recorder()
+    conn.ensure_connected = lambda: False
+    bot.step()
+    bot.step()
+    conn.ensure_connected = lambda: True
+    bot.step()
+    system = [t for c, t in rec.msgs if c == "system"]
+    assert len([t for t in system if "Lost connection" in t]) == 1
+    assert any("restored" in t for t in system)
+
+
+def test_daily_and_weekly_summary(tmp_path, account):
+    friday = datetime(2026, 9, 25, 21, 10, tzinfo=timezone.utc)
+    bot, conn = build(tmp_path, account, now=friday)
+    bot.notifier = rec = Recorder()
+    conn.deals = closed_deals(1, 120.0, minutes_ago=120, now=friday)
+    bot.step()
+    bot.step()                                        # only once per day
+    summaries = [t for c, t in rec.msgs if c == "summary"]
+    assert len(summaries) == 2
+    assert "Daily summary 2026-09-25" in summaries[0] and "+120.00 USD" in summaries[0]
+    assert "Weekly summary" in summaries[1]
+
+
+def test_performance_endpoint_data(tmp_path, account):
+    import json
+    bot, conn = build(tmp_path, account)
+    conn.deals = closed_deals(1, 50.0) + closed_deals(2, -20.0, minutes_ago=10)
+    bot.step()
+    perf = bot.performance()
+    json.dumps(perf, allow_nan=False)
+    week = perf["periods"]["7d"]
+    assert perf["ready"] and week["trades"] == 2 and week["net"] == 30.0
+    assert perf["recent"][0]["position_id"] == 2      # newest first
+
+
+def test_entry_breakdown_saved_for_attribution(tmp_path, account):
+    from goldbot.mt5_connector import OrderResult
+    bot, conn = build(tmp_path, account)
+    conn.open_market = lambda *a, **k: OrderResult(ok=True, ticket=777)
+    bot.step()
+    meta = bot.state.get("trade_meta")["777"]
+    assert meta["total"] == 70 and meta["parts"]["yield"] == 25

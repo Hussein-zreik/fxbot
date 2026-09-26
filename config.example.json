@@ -125,6 +125,30 @@
     "allow_close_all": true,
     "_comment": "Phone dashboard. Set a long random secret in the DASHBOARD_TOKEN env var (dashboard won't start without one). Keep host 127.0.0.1 and publish it privately with: tailscale serve --bg 8765"
   },
+  "alerts": {
+    "enabled": true,
+    "token_env": "TELEGRAM_BOT_TOKEN",
+    "chat_id_env": "TELEGRAM_CHAT_ID",
+    "prefix": "🟡 GoldBot |",
+    "categories": [
+      "trade",
+      "risk",
+      "shock",
+      "news",
+      "control",
+      "system",
+      "summary"
+    ],
+    "dedupe_seconds": 60,
+    "daily_summary_utc": "21:05",
+    "weekly_summary_weekday": 4,
+    "_comment": "Telegram push alerts. Put TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in environment variables (run: python -m goldbot.notifier --setup). Remove a category from the list to mute it."
+  },
+  "performance": {
+    "lookback_days": 365,
+    "refresh_minutes": 5,
+    "recent_trades": 20
+  },
   "risk": {
     "risk_per_trade": 0.01,
     "sl_atr_mult": 1.5,
