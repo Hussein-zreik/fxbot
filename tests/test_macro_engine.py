@@ -29,13 +29,13 @@ def test_yield_spike_is_bearish_gold():
     eng.refresh()
     snap = eng.snapshot()
     assert round(snap.delta_bp, 6) == 2.5
-    assert snap.score == -30
+    assert snap.score == -25
 
 
 def test_yield_drop_is_bullish_gold():
     eng = engine(yield_series(-3.0))
     eng.refresh()
-    assert eng.snapshot().score == 30
+    assert eng.snapshot().score == 25
 
 
 def test_small_move_scores_zero():
@@ -49,7 +49,7 @@ def test_legacy_x10_quote_normalised():
     eng.refresh()
     snap = eng.snapshot()
     assert abs(snap.value - 4.275) < 1e-9
-    assert snap.score == -30
+    assert snap.score == -25
 
 
 def test_stale_data_scores_zero():

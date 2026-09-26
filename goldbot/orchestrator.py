@@ -27,18 +27,20 @@ from .macro_engine import MacroDataEngine, YieldSnapshot
 from .mt5_connector import BUY, PositionInfo
 from .news_filter import NewsFilterEngine, NewsState
 from .risk_manager import RiskManager, round_volume_down
+from .sentiment_engine import SentimentEngine, SentimentSnapshot
 from .signal_model import Signal, build_signal
 from .state import StateStore
 from .technical_engine import TechnicalEngine, TechnicalSnapshot
+from .trend_engine import TrendEngine, TrendSnapshot
 
 log = logging.getLogger(__name__)
 
 JOURNAL_FIELDS = [
     "logged_at", "bar_time", "total", "macro", "yield_pts", "dxy_pts",
-    "silver_pts", "vwap_pts", "signal", "blocked_by", "action", "yield",
+    "silver_pts", "trend_pts", "news_pts", "vwap_pts", "signal", "blocked_by", "action", "yield",
     "yield_delta_bp", "yield_z1h", "yield_stale", "gs_corr", "gold_break",
     "silver_break", "usd_break", "usd_roc_pct", "divergence", "close", "vwap",
-    "atr", "news", "open_positions",
+    "atr", "trend", "ai_sentiment", "ai_headlines", "news", "open_positions",
 ]
 
 
@@ -54,19 +56,22 @@ def _fmt(x: float, spec: str = ".2f") -> str:
 class BotOrchestrator:
     def __init__(self, cfg: AppConfig, connector, macro: MacroDataEngine,
                  news: NewsFilterEngine, risk: RiskManager, state: StateStore,
-                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 sentiment: Optional[SentimentEngine] = None):
         self.cfg = cfg
         self.connector = connector
         self.macro = macro
         self.news = news
         self.risk = risk
         self.state = state
+        self.sentiment = sentiment
         self._clock = clock
         self._stop = threading.Event()
 
         self.gold: Optional[str] = None
         self.correlation: Optional[CorrelationEngine] = None
         self.technical: Optional[TechnicalEngine] = None
+        self.trend: Optional[TrendEngine] = None
         self._last_bar: Optional[datetime] = None
         self._prev_tickets: Optional[set] = None
         self._market_closed_logged = False
@@ -88,6 +93,7 @@ class BotOrchestrator:
         self.correlation = CorrelationEngine(self.connector, self.cfg.strategy,
                                              self.gold, silver, eurusd, dxy)
         self.technical = TechnicalEngine(self.connector, self.cfg.strategy, self.gold)
+        self.trend = TrendEngine(self.connector, self.cfg.trend, self.gold)
         self.news.refresh(force=False)
         log.info("Trading %s | silver %s | USD proxy %s | dry_run=%s",
                  self.gold, silver, dxy or f"1/{eurusd}", self.connector.dry_run)
@@ -95,6 +101,8 @@ class BotOrchestrator:
     def run(self) -> None:
         self.setup()
         self.macro.start()
+        if self.sentiment:
+            self.sentiment.start()
         interval = self.cfg.execution.loop_interval_seconds
         log.info("Main loop started (every %ss). Ctrl+C to stop.", interval)
         try:
@@ -112,6 +120,8 @@ class BotOrchestrator:
     def stop(self) -> None:
         self._stop.set()
         self.macro.stop()
+        if self.sentiment:
+            self.sentiment.stop()
         self.connector.shutdown()
         log.info("Bot stopped. Open positions keep their broker-side SL/TP.")
 
@@ -154,10 +164,13 @@ class BotOrchestrator:
 
         ys = self.macro.snapshot()
         cs = self.correlation.evaluate()
-        sig = build_signal(ys, cs, tech, self.cfg.strategy)
+        trend = self.trend.evaluate()
+        ai = self.sentiment.snapshot() if self.sentiment else SentimentSnapshot()
+        sig = build_signal(ys, cs, tech, self.cfg.strategy, trend, ai)
         positions = self.connector.positions(self.gold, magic)
         action = self._decide_and_execute(sig, tech, news_state, positions, acc)
-        self._report(sig, ys, cs, tech, news_state, positions, action, guard.daily_loss_pct)
+        self._report(sig, ys, cs, tech, trend, ai, news_state, positions, action,
+                     guard.daily_loss_pct)
 
     # ----------------------------------------------------------------- #
     # Entry gates and execution
@@ -311,18 +324,22 @@ class BotOrchestrator:
     # Reporting
     # ----------------------------------------------------------------- #
     def _report(self, sig: Signal, ys: YieldSnapshot, cs: CorrelationSnapshot,
-                tech: TechnicalSnapshot, ns: NewsState, positions, action: str,
-                daily_loss: float) -> None:
+                tech: TechnicalSnapshot, trend: TrendSnapshot, ai: SentimentSnapshot,
+                ns: NewsState, positions, action: str, daily_loss: float) -> None:
         news_txt = f"BLACKOUT {ns.reason}" if ns.blackout else "clear"
         log.info(
-            "BAR %s | score %+d (Y%+d D%+d S%+d V%+d) | 10Y %s d15 %sbp z %s | "
-            "R %s | close %s VWAP %s ATR %s | news %s | day P/L %s | pos %d | %s",
+            "BAR %s | score %+d (Y%+d D%+d S%+d T%+d N%+d V%+d) | 10Y %s d15 %sbp | "
+            "R %s | trend %s | AI %s (%d) | close %s VWAP %s ATR %s | news %s | "
+            "day P/L %s | pos %d | %s",
             f"{tech.bar_time:%H:%M}Z", sig.total, sig.yield_score, sig.dxy_score,
-            sig.silver_score, sig.vwap_score, _fmt(ys.value, ".3f"),
-            _fmt(ys.delta_bp, "+.1f"), _fmt(ys.zscore_1h, "+.1f"),
-            _fmt(cs.correlation), _fmt(tech.close), _fmt(tech.vwap), _fmt(tech.atr),
-            news_txt, f"{-daily_loss:+.2%}", len(positions), action,
+            sig.silver_score, sig.trend_score, sig.news_score, sig.vwap_score,
+            _fmt(ys.value, ".3f"), _fmt(ys.delta_bp, "+.1f"), _fmt(cs.correlation),
+            trend.summary(), _fmt(ai.sentiment, "+.2f"), ai.relevant_count,
+            _fmt(tech.close), _fmt(tech.vwap), _fmt(tech.atr), news_txt,
+            f"{-daily_loss:+.2%}", len(positions), action,
         )
+        for line in ai.top:
+            log.debug("AI top headline: %s", line)
         if sig.reasons:
             log.debug("Signal notes: %s", "; ".join(sig.reasons))
         self._journal({
@@ -330,6 +347,7 @@ class BotOrchestrator:
             "bar_time": tech.bar_time.isoformat() if tech.bar_time else "",
             "total": sig.total, "macro": sig.macro, "yield_pts": sig.yield_score,
             "dxy_pts": sig.dxy_score, "silver_pts": sig.silver_score,
+            "trend_pts": sig.trend_score, "news_pts": sig.news_score,
             "vwap_pts": sig.vwap_score, "signal": sig.direction or "",
             "blocked_by": "; ".join(sig.blocked_by), "action": action,
             "yield": ys.value, "yield_delta_bp": ys.delta_bp, "yield_z1h": ys.zscore_1h,
@@ -337,7 +355,8 @@ class BotOrchestrator:
             "gold_break": cs.gold_break, "silver_break": cs.silver_break,
             "usd_break": cs.usd_break, "usd_roc_pct": cs.usd_roc_pct,
             "divergence": cs.divergence, "close": tech.close, "vwap": tech.vwap,
-            "atr": tech.atr, "news": news_txt, "open_positions": len(positions),
+            "atr": tech.atr, "trend": trend.summary(), "ai_sentiment": ai.sentiment,
+            "ai_headlines": " || ".join(ai.top), "news": news_txt, "open_positions": len(positions),
         })
 
     def _journal(self, row: dict) -> None:

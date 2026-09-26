@@ -52,11 +52,18 @@ def yield_drop(_ticker):
     return pd.Series(vals, index=idx)
 
 
-def build(tmp_path, account, calendar=None, now=NOW):
+def trend_bars(drift: float, minutes: int):
+    i = np.arange(400)
+    closes = 2000 + drift * i + 20 * np.sin(i / 4.0)
+    return make_bars(closes, NOW - timedelta(minutes=minutes * 400), minutes)
+
+
+def build(tmp_path, account, calendar=None, now=NOW, extra_rates=None):
     cfg = AppConfig(state_file=str(tmp_path / "state.json"),
                     journal_file=str(tmp_path / "journal.csv"))
     cfg.news.cache_file = str(tmp_path / "cal.json")
-    conn = FakeConnector(bullish_market(), Tick(2651.0, 2651.3, 1), account)
+    conn = FakeConnector({**bullish_market(), **(extra_rates or {})},
+                         Tick(2651.0, 2651.3, 1), account)
     clock = lambda: now  # noqa: E731
     state = StateStore(cfg.state_file)
     macro = MacroDataEngine(cfg.strategy, fetcher=yield_drop, clock=clock)
@@ -81,7 +88,7 @@ def test_full_bullish_stack_places_buy(tmp_path, account):
     _, _, volume, sl, tp = opens[0]
     assert sl < 2651.3 < tp and volume > 0
     journal = (tmp_path / "journal.csv").read_text()
-    assert "BUY" in journal and ",100," in journal
+    assert "BUY" in journal and ",70," in journal  # 25+20+20+5, trend unknown
 
     bot.step()  # same closed bar -> no duplicate order
     assert len([s for s in conn.sent if s[0] == "open"]) == 1
@@ -134,3 +141,20 @@ def test_outside_session_skips(tmp_path, account):
     bot, conn = build(tmp_path, account, now=late)
     bot.step()
     assert not [s for s in conn.sent if s[0] == "open"]
+
+
+def test_uptrend_adds_trend_points(tmp_path, account):
+    up = {("XAUUSD", "H4"): trend_bars(1.5, 240), ("XAUUSD", "H1"): trend_bars(1.5, 60)}
+    bot, conn = build(tmp_path, account, extra_rates=up)
+    bot.step()
+    assert [s for s in conn.sent if s[0] == "open"][0][1] == "BUY"
+    journal = (tmp_path / "journal.csv").read_text()
+    assert ",90," in journal and "H4 UP H1 UP" in journal   # 70 + 20 trend
+
+
+def test_h4_downtrend_blocks_buy(tmp_path, account):
+    mixed = {("XAUUSD", "H4"): trend_bars(-1.5, 240), ("XAUUSD", "H1"): trend_bars(1.5, 60)}
+    bot, conn = build(tmp_path, account, extra_rates=mixed)
+    bot.step()
+    assert not [s for s in conn.sent if s[0] == "open"]
+    assert "against the higher-timeframe trend" in (tmp_path / "journal.csv").read_text()

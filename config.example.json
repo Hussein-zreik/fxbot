@@ -21,10 +21,10 @@
     "correlation_timeframe": "M15",
     "buy_threshold": 60,
     "sell_threshold": -60,
-    "weight_yield": 30,
-    "weight_dxy": 30,
-    "weight_silver": 30,
-    "weight_vwap": 10,
+    "weight_yield": 25,
+    "weight_dxy": 20,
+    "weight_silver": 20,
+    "weight_vwap": 5,
     "yield_ticker": "^TNX",
     "yield_trigger_bp": 2.0,
     "yield_window_minutes": 15,
@@ -64,6 +64,50 @@
     "partial_close_fraction": 0.5,
     "breakeven_buffer_points": 10,
     "close_fully_if_unsplittable": true
+  },
+  "trend": {
+    "enabled": true,
+    "timeframes": [
+      "H4",
+      "H1"
+    ],
+    "weights": [
+      10,
+      10
+    ],
+    "ema_fast": 50,
+    "ema_slow": 200,
+    "ema_slope_bars": 5,
+    "adx_period": 14,
+    "adx_min": 20.0,
+    "swing_strength": 3,
+    "filter_timeframe": "H4",
+    "bars": 400,
+    "_comment": "Trend per timeframe: EMA50/200 alignment + ADX>=adx_min + swing structure. Weights are points per timeframe. filter_timeframe blocks counter-trend trades (\"\" disables)."
+  },
+  "ai_news": {
+    "enabled": true,
+    "weight": 10,
+    "api_base_url": "https://api.groq.com/openai/v1",
+    "api_key_env": "GROQ_API_KEY",
+    "model": "llama-3.3-70b-versatile",
+    "json_mode": true,
+    "feeds": [
+      "https://news.google.com/rss/search?q=gold+price+OR+XAUUSD+when:1d&hl=en-US&gl=US&ceid=US:en",
+      "https://news.google.com/rss/search?q=Federal+Reserve+OR+Treasury+yields+OR+US+dollar+when:1d&hl=en-US&gl=US&ceid=US:en",
+      "https://www.fxstreet.com/rss/news"
+    ],
+    "refresh_minutes": 5,
+    "lookback_hours": 6.0,
+    "half_life_hours": 2.0,
+    "min_relevant_headlines": 3,
+    "min_relevance": 0.3,
+    "deadband": 0.15,
+    "batch_size": 20,
+    "max_new_per_refresh": 60,
+    "request_timeout_s": 30.0,
+    "cache_file": "data/sentiment_cache.json",
+    "_comment": "AI headline sentiment. Put your free Groq key in the GROQ_API_KEY environment variable (never in this file). Any OpenAI-compatible API works: change api_base_url, api_key_env and model."
   },
   "risk": {
     "risk_per_trade": 0.01,

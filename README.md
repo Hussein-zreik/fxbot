@@ -1,9 +1,10 @@
 # GoldBot — Inter-Market XAUUSD Trading System for MetaTrader 5
 
 A Python bot for XAUUSD (gold) that runs through the official `MetaTrader5`
-library. It scores four independent signal blocks on a -100 to +100 scale.
-It trades only when the macro picture agrees and price retests VWAP, and it
-places every order with ATR-based stops and fixed 1% risk sizing.
+library. It scores six independent signal blocks on a -100 to +100 scale:
+macro data, the dollar, silver, multi-timeframe trend, AI-read news headlines
+and a VWAP retest. It trades only when enough of them agree and never against
+the 4-hour trend. Every order has ATR-based stops and fixed 1% risk sizing.
 
 > **Risk notice.** This is software, not financial advice. The rules are
 > reasonable hypotheses, but nobody has backtested them. Run it in dry-run
@@ -16,16 +17,25 @@ places every order with ATR-based stops and fixed 1% risk sizing.
 
 | Block | Source | Rule | Points |
 |---|---|---|---|
-| **A. Yield** | `^TNX` (yfinance), 5-min | 10Y yield change over 15 min ≥ **+2 bp** → bearish gold; ≤ **−2 bp** → bullish. 1h z-score is logged (optional gate). Data older than 30 min scores 0. | ±30 |
-| **B1. DXY** | MT5 `DXY`/`USDX` or `1/EURUSD`, M15 | USD closes above its 20-bar Donchian high → bearish gold; below its low → bullish. | ±30 |
-| **B2. Silver** | MT5 `XAUUSD` + `XAGUSD`, M15 | Gold **and** silver break the 20-bar Donchian in the same direction, USD moves the other way, and the 30-bar return correlation R ≥ 0.6 → ±30. Gold breaks but silver doesn't → **divergence**: 0 points, and entries in that direction are blocked. | ±30 |
-| **D. VWAP** | MT5 `XAUUSD`, M5 | Close inside `[VWAP, VWAP + 1×ATR]` for a long, `[VWAP − 1×ATR, VWAP]` for a short. Counts only in the direction of the macro bias. | ±10 |
+| **A. Yield** | `^TNX` (yfinance), 5-min | 10Y yield change over 15 min ≥ **+2 bp** → bearish gold; ≤ **−2 bp** → bullish. 1h z-score is logged (optional gate). Data older than 30 min scores 0. | ±25 |
+| **B1. DXY** | MT5 `DXY`/`USDX` or `1/EURUSD`, M15 | USD closes above its 20-bar Donchian high → bearish gold; below its low → bullish. | ±20 |
+| **B2. Silver** | MT5 `XAUUSD` + `XAGUSD`, M15 | Gold **and** silver break the 20-bar Donchian in the same direction, USD moves the other way, and the 30-bar return correlation R ≥ 0.6 → ±20. Gold breaks but silver doesn't → **divergence**: 0 points, and entries in that direction are blocked. | ±20 |
+| **E. Trend** | MT5 `XAUUSD`, H4 + H1 | Per timeframe: **up** if close > EMA50 > EMA200 with EMA50 rising, **ADX ≥ 20** (really trending, not ranging), and swing structure not showing lower highs + lower lows. Down is the mirror. H4 trend is also a **filter**. | ±20 (10 + 10) |
+| **F. AI news** | Free RSS feeds + Groq LLM | An AI model rates each new headline's impact on gold (−1…+1) and relevance (0…1). Ratings are blended, with newer and more relevant headlines weighted more (2 h half-life, 6 h window). Needs ≥ 3 relevant headlines. | ±10 |
+| **D. VWAP** | MT5 `XAUUSD`, M5 | Close inside `[VWAP, VWAP + 1×ATR]` for a long, `[VWAP − 1×ATR, VWAP]` for a short. Counts only in the direction of the other blocks' bias. | ±5 |
 
-**Entry:** total ≥ **+60** → BUY, ≤ **−60** → SELL. The VWAP retest is also a
-hard gate. In practice an entry needs **at least two macro blocks agreeing,
-plus the VWAP retest**.
+These are the approved "Balanced" weights (25 + 20 + 20 + 20 + 10 + 5 = 100).
+Every weight is editable in the config.
+
+**Entry:** total ≥ **+60** → BUY, ≤ **−60** → SELL. Typical ways to reach 60:
+- yield + dollar + silver (65)
+- yield + trend + news + VWAP (60)
+- dollar + silver + trend (60)
 
 **Gates that block entries even with a valid score:**
+- **Against the 4-hour trend:** no BUY while H4 is down, no SELL while H4 is up. A ranging H4 blocks nothing.
+- **No VWAP retest** in the trade direction.
+- **Gold/silver divergence** against the trade direction.
 - High-impact USD news blackout: 30 min before to 15 min after the release.
 - Maximum open positions reached (default 1).
 - Post-exit cooldown (default 15 min).
@@ -68,12 +78,14 @@ goldbot/
   news_filter.py           NewsFilterEngine – ForexFactory calendar, cache, blackout state
   correlation_engine.py    CorrelationEngine – gold/silver/USD breakouts, correlation, divergence
   technical_engine.py      TechnicalEngine – session VWAP (00:00 UTC anchor), ATR
+  trend_engine.py          TrendEngine – H4/H1 EMA50/200, ADX, swing structure, trend filter
+  sentiment_engine.py      SentimentEngine – RSS headlines scored by an AI model (Groq), cached
   signal_model.py          score combination and entry decision
   risk_manager.py          RiskManager – sizing, SL/TP, daily guardrail
   orchestrator.py          BotOrchestrator – 10-second main loop, news management, journal
   indicators.py            pure indicator functions
   state.py                 crash-safe persistent state (data/state.json)
-tests/                     43 tests using a fake MT5 connector (run anywhere)
+tests/                     67 tests using a fake MT5 connector (run anywhere)
 ```
 
 ---
@@ -85,7 +97,7 @@ tests/                     43 tests using a fake MT5 connector (run anywhere)
 | `MetaTrader5` | Official MT5 Python API (**Windows only**, talks to the running terminal) |
 | `pandas`, `numpy` | Bars, indicators |
 | `yfinance` | 10-year Treasury yield (`^TNX`) |
-| `requests` | Economic calendar download |
+| `requests` | Economic calendar, news feeds and the AI API |
 | `pytest`, `flake8` | Tests and lint (dev only) |
 
 ```bat
@@ -143,7 +155,17 @@ pip install -r requirements.txt
       setx MT5_PASSWORD "your-password"
       setx MT5_SERVER "Broker-Demo"
       ```
-12. **First run in dry-run** (`execution.dry_run: true`, the default):
+12. **Turn on AI news (free Groq key):**
+    - Sign up at **console.groq.com** (no credit card), open *API Keys* → *Create API Key*, and copy it.
+    - On the VPS, store it as an environment variable. Never put it in `config.json`, which could be shared by accident:
+      ```bat
+      setx GROQ_API_KEY "gsk_your_key_here"
+      ```
+    - Close and reopen the terminal window so the variable is picked up.
+    - Without a key, the bot still runs. The AI news block just scores 0 and the log says `AI news disabled`.
+    - If the log shows a *model not found / decommissioned* error, pick a current model at console.groq.com/docs/models and set `ai_news.model`.
+    - **Switching provider later** is a config change only. Any OpenAI-compatible API works: set `ai_news.api_base_url`, `ai_news.api_key_env` and `ai_news.model`. For example, Google Gemini: `https://generativelanguage.googleapis.com/v1beta/openai`. Local Ollama: `http://localhost:11434/v1`, with any non-empty key.
+13. **First run in dry-run** (`execution.dry_run: true`, the default):
     ```bat
     python run_bot.py --config config.json
     ```
@@ -152,27 +174,30 @@ pip install -r requirements.txt
     - `Resolved symbol XAUUSD -> …`
     - `Detected broker server time offset: UTC+3.0h`
     - `Calendar refreshed: N matching high-impact events`
-    - One `BAR hh:mmZ | score … ` line every 5 minutes.
-13. **Switch to demo trading:** set `execution.dry_run: false` and restart.
-14. **Live trading later** needs **both** `dry_run: false` **and** `allow_live_trading: true`. If a real account is detected without the second flag, the bot forces itself back into dry-run and logs a CRITICAL message.
+    - `AI news: N new headlines scored` every few minutes.
+    - One line every 5 minutes, e.g.
+      `BAR 13:05Z | score +65 (Y+25 D+20 S+0 T+20 N+0 V+0) | … | trend H4 UP H1 UP | AI +0.42 (7) | …`
+      The letters are Y = yield, D = dollar, S = silver, T = trend, N = AI news, V = VWAP.
+14. **Switch to demo trading:** set `execution.dry_run: false` and restart.
+15. **Live trading later** needs **both** `dry_run: false` **and** `allow_live_trading: true`. If a real account is detected without the second flag, the bot forces itself back into dry-run and logs a CRITICAL message.
 
 ### D. Keep it running 24/5
-15. Run it with **`start_bot.bat`**, which restarts the bot 30 seconds after any crash or exit.
-16. **Start automatically after a reboot:**
+16. Run it with **`start_bot.bat`**, which restarts the bot 30 seconds after any crash or exit.
+17. **Start automatically after a reboot:**
     - Task Scheduler → *Create Task* → Trigger *At log on* → Action: `C:\goldbot\start_bot.bat`, "Start in" `C:\goldbot`.
     - Use Sysinternals **Autologon** so the VPS logs your user in after a reboot. MT5 needs a desktop session.
-17. **Disconnect from Remote Desktop by closing the window.** Do **not** click *Sign out*, which kills the terminal and the bot.
-18. **Logs** are in `logs\goldbot.log` (rotating), the per-bar journal is `logs\signal_journal.csv`, and state is in `data\state.json`.
+18. **Disconnect from Remote Desktop by closing the window.** Do **not** click *Sign out*, which kills the terminal and the bot.
+19. **Logs** are in `logs\goldbot.log` (rotating), the per-bar journal is `logs\signal_journal.csv`, and state is in `data\state.json`.
 
 ### E. Monitoring from your iPhone
-19. Install **MetaTrader 5** from the App Store.
+20. Install **MetaTrader 5** from the App Store.
     - Settings → *New Account* → search for your broker's server.
     - Log in with the same account number. Use the **investor (read-only) password** if you only want to watch and never trade by accident.
-20. Bot trades show the comment `goldbot +70` (the score at entry) and magic number `20260926`. If you close a bot trade by hand, the bot notices and starts its cooldown.
-21. **Push alerts:**
+21. Bot trades show the comment `goldbot +70` (the score at entry) and magic number `20260926`. If you close a bot trade by hand, the bot notices and starts its cooldown.
+22. **Push alerts:**
     - Copy your **MetaQuotes ID** from the iPhone app (Settings → Chat and messages).
     - Paste it into the desktop terminal: Tools → Options → Notifications, tick *Enable Push Notifications*, and enable trade-transaction notifications if your build shows the option.
-22. For full log access, use Remote Desktop from the iPhone to the VPS.
+23. For full log access, use Remote Desktop from the iPhone to the VPS.
 
 ---
 
@@ -187,7 +212,13 @@ pip install -r requirements.txt
 | `execution.cooldown_minutes` | `15` | Wait after a position closes |
 | `execution.trade_weekdays` | `[0..4]` | 0 = Monday |
 | `strategy.buy_threshold` / `sell_threshold` | `60` / `-60` | Score needed to enter |
-| `strategy.weight_*` | `30/30/30/10` | Block weights |
+| `strategy.weight_*` | `25/20/20/5` | Yield / DXY / silver / VWAP weights |
+| `trend.weights` | `[10, 10]` | Points for H4 and H1 trend |
+| `trend.filter_timeframe` | `"H4"` | Block counter-trend trades (`""` disables) |
+| `trend.adx_min` | `20` | Below this ADX, the market counts as ranging |
+| `ai_news.weight` | `10` | Maximum points from AI headline sentiment |
+| `ai_news.model` | `llama-3.3-70b-versatile` | Groq model name |
+| `ai_news.feeds` | Google News + FXStreet | Any RSS/Atom feed URLs |
 | `strategy.yield_trigger_bp` | `2.0` | Basis points in 15 min |
 | `strategy.min_correlation` | `0.6` | Gold/silver return correlation needed for confluence |
 | `risk.risk_per_trade` | `0.01` | 1% of equity |
@@ -206,6 +237,10 @@ pip install -r requirements.txt
 - **Signal frequency.** The rules require two of the three macro blocks and a breakout or a 2 bp yield move at the same time. Expect few trades. Use the journal to see which gate blocks most often before loosening anything.
 - **No built-in backtester.** The MT5 Strategy Tester cannot run Python, and a proper backtest also needs historical intraday yields. The journal CSV gives you a clean forward-test record instead.
 - **Exits** happen through SL/TP, the pre-news rules and the guardrail. An opposite signal does not close a trade.
+- **AI news is the noisiest signal.** That's why it can add at most 10 points and can never trigger a trade on its own.
+  - Headlines are treated as untrusted data, and the model's reply is parsed strictly and clamped.
+  - Free tiers have rate limits, so the bot only sends *new* headlines (max 60 per refresh) and caches every rating on disk.
+- **Trend-following trades late by design.** EMA/ADX confirm a trend after it has started. The H4 filter avoids fighting big moves but can miss early reversals.
 - **Calendar feed.** The ForexFactory JSON feed is rate-limited. The bot downloads it at most hourly and caches it on disk.
 
 ---
@@ -214,6 +249,6 @@ pip install -r requirements.txt
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q        # 43 tests, no MT5 needed
+python -m pytest -q        # 67 tests, no MT5 needed
 python -m flake8 --max-line-length 100 goldbot run_bot.py tests
 ```

@@ -41,10 +41,11 @@ class StrategyConfig:
 
     buy_threshold: int = 60
     sell_threshold: int = -60
-    weight_yield: int = 30
-    weight_dxy: int = 30
-    weight_silver: int = 30
-    weight_vwap: int = 10
+    # Balanced weights: 25 + 20 + 20 + (10 + 10) + 10 + 5 = 100
+    weight_yield: int = 25
+    weight_dxy: int = 20
+    weight_silver: int = 20
+    weight_vwap: int = 5
 
     # A. Treasury yield engine
     yield_ticker: str = "^TNX"
@@ -68,6 +69,54 @@ class StrategyConfig:
     atr_period: int = 14
     vwap_retest_atr_mult: float = 1.0
     require_vwap_retest: bool = True
+
+
+_GOOGLE_NEWS = "https://news.google.com/rss/search?q="
+_GOOGLE_NEWS_OPTS = "&hl=en-US&gl=US&ceid=US:en"
+
+
+@dataclass
+class TrendConfig:
+    """E. Multi-timeframe trend engine (EMA alignment + ADX + market structure)."""
+    enabled: bool = True
+    timeframes: List[str] = field(default_factory=lambda: ["H4", "H1"])
+    weights: List[int] = field(default_factory=lambda: [10, 10])  # per timeframe
+    ema_fast: int = 50
+    ema_slow: int = 200
+    ema_slope_bars: int = 5
+    adx_period: int = 14
+    adx_min: float = 20.0           # below this the market is "ranging"
+    swing_strength: int = 3         # bars each side that define a swing point
+    # Filter: block trades against the trend of this timeframe ("" disables).
+    filter_timeframe: str = "H4"
+    bars: int = 400
+
+
+@dataclass
+class SentimentConfig:
+    """F. AI headline sentiment via any OpenAI-compatible chat API (default: Groq)."""
+    enabled: bool = True
+    weight: int = 10
+    api_base_url: str = "https://api.groq.com/openai/v1"
+    api_key_env: str = "GROQ_API_KEY"   # the key itself is read from this env var
+    model: str = "llama-3.3-70b-versatile"
+    json_mode: bool = True           # set false if a provider rejects response_format
+    feeds: List[str] = field(default_factory=lambda: [
+        _GOOGLE_NEWS + "gold+price+OR+XAUUSD+when:1d" + _GOOGLE_NEWS_OPTS,
+        _GOOGLE_NEWS + "Federal+Reserve+OR+Treasury+yields+OR+US+dollar+when:1d"
+        + _GOOGLE_NEWS_OPTS,
+        "https://www.fxstreet.com/rss/news",
+    ])
+    refresh_minutes: int = 5
+    lookback_hours: float = 6.0
+    half_life_hours: float = 2.0     # older headlines count less
+    min_relevant_headlines: int = 3
+    min_relevance: float = 0.3
+    deadband: float = 0.15           # |sentiment| below this scores 0
+    batch_size: int = 20
+    max_new_per_refresh: int = 60    # protects the free-tier quota
+    request_timeout_s: float = 30.0
+    cache_file: str = "data/sentiment_cache.json"
 
 
 @dataclass
@@ -127,6 +176,8 @@ class AppConfig:
     symbols: SymbolConfig = field(default_factory=SymbolConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     news: NewsConfig = field(default_factory=NewsConfig)
+    trend: TrendConfig = field(default_factory=TrendConfig)
+    ai_news: SentimentConfig = field(default_factory=SentimentConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     log_dir: str = "logs"
@@ -166,6 +217,13 @@ def _validate(cfg: AppConfig) -> None:
         raise ValueError("execution.max_open_positions must be >= 1")
     if not 0 < cfg.news.partial_close_fraction < 1:
         raise ValueError("news.partial_close_fraction must be in (0, 1)")
+    t = cfg.trend
+    if len(t.timeframes) != len(t.weights):
+        raise ValueError("trend.timeframes and trend.weights must have equal length")
+    if t.filter_timeframe and t.filter_timeframe not in t.timeframes:
+        raise ValueError("trend.filter_timeframe must be one of trend.timeframes")
+    if t.ema_fast >= t.ema_slow:
+        raise ValueError("trend.ema_fast must be smaller than trend.ema_slow")
     for d in e.trade_weekdays:
         if d not in range(7):
             raise ValueError("execution.trade_weekdays values must be 0-6")

@@ -6,8 +6,10 @@ from goldbot.config import StrategyConfig
 from goldbot.correlation_engine import invert_fx_bars, score_correlation
 from goldbot.macro_engine import YieldSnapshot
 from goldbot.mt5_connector import BUY, SELL
+from goldbot.sentiment_engine import SentimentSnapshot
 from goldbot.signal_model import build_signal
 from goldbot.technical_engine import TechnicalSnapshot
+from goldbot.trend_engine import TrendSnapshot
 from tests.conftest import make_bars
 
 START = datetime(2026, 9, 23, tzinfo=timezone.utc)
@@ -33,7 +35,7 @@ def test_bullish_confluence_scores_silver_and_dxy():
     snap = score_correlation(g, s, u, CFG)
     assert snap.correlation > CFG.min_correlation
     assert snap.gold_break == 1 and snap.silver_break == 1 and snap.usd_break == -1
-    assert snap.silver_score == 30 and snap.dxy_score == 30
+    assert snap.silver_score == 20 and snap.dxy_score == 20
     assert not snap.divergence
 
 
@@ -72,28 +74,44 @@ def corr(dxy=0, silver=0, divergence=False, gold_break=0):
 
 
 def test_full_bull_stack_is_buy_100():
-    sig = build_signal(ys(30), corr(30, 30), tech(long=True), CFG)
+    trend = TrendSnapshot(score=20, filter_dir=1)
+    news = SentimentSnapshot(score=10)
+    sig = build_signal(ys(25), corr(20, 20), tech(long=True), CFG, trend, news)
     assert sig.total == 100 and sig.direction == BUY
 
 
-def test_two_blocks_plus_vwap_reaches_threshold():
-    sig = build_signal(ys(-30), corr(dxy=-30), tech(short=True), CFG)
+def test_three_macro_blocks_plus_vwap_reaches_threshold():
+    sig = build_signal(ys(-25), corr(dxy=-20, silver=-20), tech(short=True), CFG)
     assert sig.total == -70 and sig.direction == SELL
 
 
+def test_trend_and_news_can_complete_a_signal():
+    trend = TrendSnapshot(score=20, filter_dir=1)
+    news = SentimentSnapshot(score=10)
+    sig = build_signal(ys(25), corr(), tech(long=True), CFG, trend, news)
+    assert sig.total == 60 and sig.direction == BUY
+
+
 def test_vwap_only_counts_with_bias():
-    sig = build_signal(ys(30), corr(dxy=30), tech(short=True), CFG)
-    assert sig.vwap_score == 0 and sig.total == 60
+    sig = build_signal(ys(25), corr(dxy=20, silver=20), tech(short=True), CFG)
+    assert sig.vwap_score == 0 and sig.total == 65
     assert sig.direction is None and "no VWAP retest" in sig.blocked_by
 
 
 def test_one_block_is_not_enough():
-    sig = build_signal(ys(30), corr(), tech(long=True), CFG)
-    assert sig.total == 40 and sig.direction is None
+    sig = build_signal(ys(25), corr(), tech(long=True), CFG)
+    assert sig.total == 30 and sig.direction is None
 
 
 def test_divergence_blocks_breakout_direction():
-    sig = build_signal(ys(30), corr(dxy=30, divergence=True, gold_break=1),
+    sig = build_signal(ys(25), corr(dxy=20, silver=20, divergence=True, gold_break=1),
                        tech(long=True), CFG)
     assert sig.direction is None
     assert any("divergence" in b for b in sig.blocked_by)
+
+
+def test_higher_timeframe_trend_blocks_counter_trend_trade():
+    down = TrendSnapshot(score=-10, filter_dir=-1)
+    sig = build_signal(ys(25), corr(dxy=20, silver=20), tech(long=True), CFG, down)
+    assert sig.total == 60 and sig.direction is None
+    assert "against the higher-timeframe trend" in sig.blocked_by
