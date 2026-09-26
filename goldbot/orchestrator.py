@@ -2,13 +2,17 @@
 
 Every ``loop_interval_seconds`` (default 10 s) it:
   1. checks the MT5 connection (reconnects if needed),
-  2. enforces the daily equity guardrail (flattens and halts on breach),
-  3. manages open trades ahead of high-impact news,
-  4. on each newly CLOSED execution bar, scores the four signal blocks and,
-     if every gate passes, sizes and sends the order.
+  2. runs commands queued by the phone dashboard (pause / resume / close all),
+  3. enforces the daily equity guardrail (flattens and halts on breach),
+  4. protects open trades ahead of high-impact news and after AI-detected
+     shock headlines,
+  5. on each newly CLOSED execution bar, closes trades whose H1 trend has
+     reversed, scores the six signal blocks and, if every gate passes,
+     sizes and sends the order,
+  6. publishes a status snapshot for the dashboard.
 
-Entries are evaluated once per closed bar, so live behaviour matches what a
-bar-by-bar backtest of the same rules would do.
+All MT5 calls happen on this loop's thread; the dashboard only reads the
+published snapshot and queues commands, so the two never race.
 """
 
 from __future__ import annotations
@@ -16,10 +20,12 @@ from __future__ import annotations
 import csv
 import logging
 import math
+import queue
 import threading
+from collections import deque
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .config import AppConfig
 from .correlation_engine import CorrelationEngine, CorrelationSnapshot
@@ -37,11 +43,14 @@ log = logging.getLogger(__name__)
 
 JOURNAL_FIELDS = [
     "logged_at", "bar_time", "total", "macro", "yield_pts", "dxy_pts",
-    "silver_pts", "trend_pts", "news_pts", "vwap_pts", "signal", "blocked_by", "action", "yield",
-    "yield_delta_bp", "yield_z1h", "yield_stale", "gs_corr", "gold_break",
-    "silver_break", "usd_break", "usd_roc_pct", "divergence", "close", "vwap",
-    "atr", "trend", "ai_sentiment", "ai_headlines", "news", "open_positions",
+    "silver_pts", "trend_pts", "news_pts", "vwap_pts", "signal", "blocked_by",
+    "action", "yield", "yield_delta_bp", "yield_z1h", "yield_stale", "gs_corr",
+    "gold_break", "silver_break", "usd_break", "usd_roc_pct", "divergence",
+    "close", "vwap", "atr", "trend", "ai_sentiment", "ai_headlines", "news",
+    "open_positions",
 ]
+
+COMMANDS = ("pause", "resume", "close_all")
 
 
 def _parse_hhmm(value: str) -> dtime:
@@ -51,6 +60,13 @@ def _parse_hhmm(value: str) -> dtime:
 
 def _fmt(x: float, spec: str = ".2f") -> str:
     return "n/a" if x is None or (isinstance(x, float) and math.isnan(x)) else format(x, spec)
+
+
+def _num(x: Any) -> Any:
+    """JSON-safe number: NaN/inf become None."""
+    if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+        return None
+    return x
 
 
 class BotOrchestrator:
@@ -75,6 +91,13 @@ class BotOrchestrator:
         self._last_bar: Optional[datetime] = None
         self._prev_tickets: Optional[set] = None
         self._market_closed_logged = False
+
+        # Dashboard plumbing (thread-safe).
+        self._commands: "queue.Queue[str]" = queue.Queue()
+        self._status_lock = threading.Lock()
+        self._status: Dict[str, Any] = {"state": "starting"}
+        self._last_bar_report: Dict[str, Any] = {}
+        self._events: deque = deque(maxlen=30)
 
     # ----------------------------------------------------------------- #
     # Lifecycle
@@ -126,35 +149,102 @@ class BotOrchestrator:
         log.info("Bot stopped. Open positions keep their broker-side SL/TP.")
 
     # ----------------------------------------------------------------- #
+    # Dashboard interface (called from the web server thread)
+    # ----------------------------------------------------------------- #
+    def submit_command(self, action: str) -> str:
+        """Queue a dashboard command; it runs on the next loop (<= 10 s)."""
+        if action not in COMMANDS:
+            raise ValueError(f"unknown command {action!r}")
+        self._commands.put(action)
+        return f"'{action}' queued - applied within {self.cfg.execution.loop_interval_seconds}s"
+
+    def status(self) -> Dict[str, Any]:
+        with self._status_lock:
+            return dict(self._status)
+
+    def _event(self, text: str) -> None:
+        self._events.appendleft({"time": self._clock().isoformat(), "text": text})
+
+    @property
+    def paused(self) -> bool:
+        return bool(self.state.get("paused", False))
+
+    def _process_commands(self) -> None:
+        while True:
+            try:
+                action = self._commands.get_nowait()
+            except queue.Empty:
+                return
+            if action == "pause":
+                self.state.set("paused", True)
+                log.warning("Dashboard: new entries PAUSED")
+                self._event("Paused new trades (dashboard)")
+            elif action == "resume":
+                self.state.set("paused", False)
+                log.warning("Dashboard: trading RESUMED")
+                self._event("Resumed trading (dashboard)")
+            elif action == "close_all":
+                # Pause too, or the next signal could immediately re-enter.
+                self.state.set("paused", True)
+                closed = self._close_bot_positions("dashboard close-all")
+                self._event(f"Closed {closed} position(s) and paused (dashboard)")
+
+    # ----------------------------------------------------------------- #
     # One loop iteration
     # ----------------------------------------------------------------- #
     def step(self) -> None:
+        ctx: Dict[str, Any] = {"connected": False}
+        try:
+            self._step(ctx)
+        finally:
+            self._publish(ctx)
+
+    def _step(self, ctx: Dict[str, Any]) -> None:
         if not self.connector.ensure_connected():
             log.error("MT5 unavailable; will retry next loop")
             return
+        ctx["connected"] = True
+        self._process_commands()
+
         acc = self.connector.account()
         if acc is None:
             return
+        ctx["account"] = acc
 
         magic = self.cfg.execution.magic
         positions = self.connector.positions(self.gold, magic)
+        ctx["positions"] = positions
         self._track_exits(positions)
 
         guard = self.risk.update_daily(acc)
+        ctx["guard"] = guard
+        self.news.refresh()
+        news_state = self.news.state()
+        ai = self.sentiment.snapshot() if self.sentiment else SentimentSnapshot()
+        ctx["news"], ctx["ai"] = news_state, ai
+
         if guard.halted:
             self._flatten(guard.reason)
             return
 
-        self.news.refresh()
-        news_state = self.news.state()
-        if self.cfg.news.manage_open_positions and positions:
-            self._manage_news(positions, news_state)
+        if positions:
+            if self.cfg.news.manage_open_positions and news_state.imminent:
+                window = timedelta(minutes=self.cfg.news.minutes_before
+                                   + self.cfg.news.minutes_after)
+                self._protect_all(positions, f"News {news_state.imminent[0].title}",
+                                  "news_handled", window)
+            if ai.shock_active and self.cfg.ai_news.shock_protect_positions:
+                window = timedelta(minutes=self.cfg.ai_news.shock_pause_minutes)
+                self._protect_all(positions, f"AI shock {ai.shock_headline[:60]}",
+                                  "shock_handled", window)
 
         if not self.connector.market_is_live(self.gold):
+            ctx["market_live"] = False
             if not self._market_closed_logged:
                 log.info("No fresh ticks on %s (market closed or feed paused)", self.gold)
                 self._market_closed_logged = True
             return
+        ctx["market_live"] = True
         self._market_closed_logged = False
 
         tech = self.technical.evaluate()
@@ -165,22 +255,30 @@ class BotOrchestrator:
         ys = self.macro.snapshot()
         cs = self.correlation.evaluate()
         trend = self.trend.evaluate()
-        ai = self.sentiment.snapshot() if self.sentiment else SentimentSnapshot()
-        sig = build_signal(ys, cs, tech, self.cfg.strategy, trend, ai)
+        if positions and self.cfg.trend.exit_on_reversal:
+            self._trend_exits(positions, trend)
         positions = self.connector.positions(self.gold, magic)
-        action = self._decide_and_execute(sig, tech, news_state, positions, acc)
+        ctx["positions"] = positions
+
+        sig = build_signal(ys, cs, tech, self.cfg.strategy, trend, ai)
+        action = self._decide_and_execute(sig, tech, news_state, ai, positions, acc)
         self._report(sig, ys, cs, tech, trend, ai, news_state, positions, action,
                      guard.daily_loss_pct)
 
     # ----------------------------------------------------------------- #
     # Entry gates and execution
     # ----------------------------------------------------------------- #
-    def _entry_gates(self, news_state: NewsState, positions: List[PositionInfo]) -> List[str]:
+    def _entry_gates(self, news_state: NewsState, ai: SentimentSnapshot,
+                     positions: List[PositionInfo]) -> List[str]:
         e = self.cfg.execution
         now = self._clock()
         gates = []
+        if self.paused:
+            gates.append("paused from dashboard")
         if news_state.blackout:
             gates.append(f"news blackout: {news_state.reason}")
+        if ai.shock_active:
+            gates.append(f"AI shock pause: {ai.shock_headline[:60]}")
         if len(positions) >= e.max_open_positions:
             gates.append(f"max open positions ({e.max_open_positions})")
         last_exit = self.state.get("last_exit_time")
@@ -202,12 +300,12 @@ class BotOrchestrator:
         return start <= t < end if start < end else (t >= start or t < end)
 
     def _decide_and_execute(self, sig: Signal, tech: TechnicalSnapshot,
-                            news_state: NewsState, positions: List[PositionInfo],
-                            acc) -> str:
+                            news_state: NewsState, ai: SentimentSnapshot,
+                            positions: List[PositionInfo], acc) -> str:
         if sig.direction is None:
             return "blocked: " + "; ".join(sig.blocked_by) if sig.blocked_by else "no signal"
 
-        gates = self._entry_gates(news_state, positions)
+        gates = self._entry_gates(news_state, ai, positions)
         if gates:
             return f"{sig.direction} skipped: " + "; ".join(gates)
 
@@ -227,8 +325,10 @@ class BotOrchestrator:
                 f"risk {plan.risk_amount:.2f} {acc.currency}")
         if result.ok:
             log.info("ORDER %s%s", "[DRY-RUN] " if result.dry_run else "", desc)
+            self._event(("DRY-RUN " if result.dry_run else "Opened ") + desc)
             return ("DRY-RUN " if result.dry_run else "OPENED ") + desc
         log.error("ORDER FAILED %s -> retcode %s %s", desc, result.retcode, result.message)
+        self._event(f"Order FAILED: {desc} ({result.retcode})")
         return f"FAILED {desc}: {result.retcode} {result.message}"
 
     # ----------------------------------------------------------------- #
@@ -240,8 +340,18 @@ class BotOrchestrator:
             closed = self._prev_tickets - tickets
             log.info("Position(s) closed: %s - cooldown %d min", sorted(closed),
                      self.cfg.execution.cooldown_minutes)
+            self._event(f"Position(s) closed: {', '.join(map(str, sorted(closed)))}")
             self.state.set("last_exit_time", self._clock().isoformat())
         self._prev_tickets = tickets
+
+    def _close_bot_positions(self, reason: str) -> int:
+        closed = 0
+        for pos in self.connector.positions(magic=self.cfg.execution.magic):
+            res = self.connector.close_position(pos)
+            log.warning("%s: close %s #%s %s %s -> %s", reason, pos.symbol, pos.ticket,
+                        pos.side, pos.volume, "ok" if res.ok else res.message)
+            closed += int(res.ok)
+        return closed
 
     def _flatten(self, reason: str) -> None:
         if self.cfg.risk.close_all_account_positions_on_halt:
@@ -254,31 +364,41 @@ class BotOrchestrator:
                         pos.side, pos.volume, "ok" if res.ok else res.message)
         if targets:
             log.warning("Trading halted: %s", reason)
+            self._event(f"Guardrail closed {len(targets)} position(s): {reason}")
 
-    def _manage_news(self, positions: List[PositionInfo], news_state: NewsState) -> None:
-        if not news_state.imminent:
-            return
-        ncfg = self.cfg.news
+    def _trend_exits(self, positions: List[PositionInfo], trend: TrendSnapshot) -> None:
+        """Close trades whose exit-timeframe trend has flipped against them."""
+        tf = self.cfg.trend.exit_timeframe
+        frame = next((f for f in trend.frames if f.timeframe == tf), None)
+        if frame is None or frame.direction == 0:
+            return  # ranging or unknown is not a reversal
+        for pos in positions:
+            side = 1 if pos.side == BUY else -1
+            if frame.direction == -side:
+                res = self.connector.close_position(pos)
+                msg = (f"Trend exit: {tf} turned {'DOWN' if side > 0 else 'UP'} - "
+                       f"closed {pos.side} #{pos.ticket}")
+                log.warning("%s (%s)", msg, "ok" if res.ok else res.message)
+                self._event(msg)
+
+    def _protect_all(self, positions: List[PositionInfo], title: str, state_key: str,
+                     window: timedelta) -> None:
+        """Breakeven or trim each open trade once per event window."""
         now = self._clock()
-        handled = self.state.get("news_handled", {})
-        window = timedelta(minutes=ncfg.minutes_before + ncfg.minutes_after)
-        event = news_state.imminent[0]
-
+        handled = self.state.get(state_key, {})
         for pos in positions:
             key = str(pos.ticket)
             if key in handled and now - datetime.fromisoformat(handled[key]) < window:
-                continue  # already protected for this news cluster
+                continue  # already protected for this event
             spec = self.connector.symbol_spec(pos.symbol)
             tick = self.connector.get_tick(pos.symbol)
             if spec is None or tick is None:
                 continue
-            action = self._protect_position(pos, spec, tick, event.title)
-            if action:
+            if self._protect_position(pos, spec, tick, title):
                 handled[key] = now.isoformat()
-
-        # Drop entries for positions that no longer exist.
+                self._event(f"{title}: protected #{pos.ticket}")
         live = {str(p.ticket) for p in positions}
-        self.state.set("news_handled", {k: v for k, v in handled.items() if k in live})
+        self.state.set(state_key, {k: v for k, v in handled.items() if k in live})
 
     def _protect_position(self, pos: PositionInfo, spec, tick, title: str) -> bool:
         ncfg = self.cfg.news
@@ -296,12 +416,11 @@ class BotOrchestrator:
             placeable = be > tick.ask + min_gap
 
         if in_profit and already_protected:
-            log.info("News '%s': #%s already protected at breakeven or better",
-                     title, pos.ticket)
+            log.info("%s: #%s already protected at breakeven or better", title, pos.ticket)
             return True
         if in_profit and placeable:
             res = self.connector.modify_sltp(pos, be, pos.tp)
-            log.warning("News '%s': #%s SL -> breakeven %.2f (%s)", title, pos.ticket, be,
+            log.warning("%s: #%s SL -> breakeven %.2f (%s)", title, pos.ticket, be,
                         "ok" if res.ok else res.message)
             return res.ok
 
@@ -309,15 +428,15 @@ class BotOrchestrator:
         part = round_volume_down(pos.volume * ncfg.partial_close_fraction, spec)
         if part >= spec.volume_min and pos.volume - part >= spec.volume_min - 1e-9:
             res = self.connector.close_position(pos, part)
-            log.warning("News '%s': #%s closed %.2f of %.2f lots (%s)", title,
+            log.warning("%s: #%s closed %.2f of %.2f lots (%s)", title,
                         pos.ticket, part, pos.volume, "ok" if res.ok else res.message)
             return res.ok
         if ncfg.close_fully_if_unsplittable:
             res = self.connector.close_position(pos)
-            log.warning("News '%s': #%s volume %.2f cannot be split - closed fully (%s)",
+            log.warning("%s: #%s volume %.2f cannot be split - closed fully (%s)",
                         title, pos.ticket, pos.volume, "ok" if res.ok else res.message)
             return res.ok
-        log.warning("News '%s': #%s cannot be split; left unchanged", title, pos.ticket)
+        log.warning("%s: #%s cannot be split; left unchanged", title, pos.ticket)
         return True
 
     # ----------------------------------------------------------------- #
@@ -342,6 +461,21 @@ class BotOrchestrator:
             log.debug("AI top headline: %s", line)
         if sig.reasons:
             log.debug("Signal notes: %s", "; ".join(sig.reasons))
+
+        self._last_bar_report = {
+            "bar_time": tech.bar_time.isoformat() if tech.bar_time else None,
+            "total": sig.total,
+            "parts": {"yield": sig.yield_score, "dollar": sig.dxy_score,
+                      "silver": sig.silver_score, "trend": sig.trend_score,
+                      "ai_news": sig.news_score, "vwap": sig.vwap_score},
+            "signal": sig.direction, "blocked_by": sig.blocked_by, "action": action,
+            "reasons": sig.reasons[:12],
+            "trend": [{"tf": f.timeframe, "dir": f.direction, "adx": _num(f.adx)}
+                      for f in trend.frames],
+            "yield": _num(ys.value), "yield_delta_bp": _num(ys.delta_bp),
+            "yield_stale": ys.stale, "gs_corr": _num(cs.correlation),
+            "close": _num(tech.close), "vwap": _num(tech.vwap), "atr": _num(tech.atr),
+        }
         self._journal({
             "logged_at": self._clock().isoformat(),
             "bar_time": tech.bar_time.isoformat() if tech.bar_time else "",
@@ -356,8 +490,82 @@ class BotOrchestrator:
             "usd_break": cs.usd_break, "usd_roc_pct": cs.usd_roc_pct,
             "divergence": cs.divergence, "close": tech.close, "vwap": tech.vwap,
             "atr": tech.atr, "trend": trend.summary(), "ai_sentiment": ai.sentiment,
-            "ai_headlines": " || ".join(ai.top), "news": news_txt, "open_positions": len(positions),
+            "ai_headlines": " || ".join(ai.top), "news": news_txt,
+            "open_positions": len(positions),
         })
+
+    def _publish(self, ctx: Dict[str, Any]) -> None:
+        """Build the JSON-safe snapshot the dashboard serves."""
+        acc, guard = ctx.get("account"), ctx.get("guard")
+        ns: Optional[NewsState] = ctx.get("news")
+        ai: Optional[SentimentSnapshot] = ctx.get("ai")
+        dash = self.cfg.dashboard
+
+        if not ctx.get("connected"):
+            mode = "DISCONNECTED"
+        elif guard is not None and guard.halted:
+            mode = "HALTED"
+        elif self.paused:
+            mode = "PAUSED"
+        elif self.connector.dry_run:
+            mode = "DRY-RUN"
+        else:
+            mode = "LIVE"
+
+        status: Dict[str, Any] = {
+            "updated": self._clock().isoformat(),
+            "mode": mode,
+            "symbol": self.gold,
+            "connected": bool(ctx.get("connected")),
+            "market_live": ctx.get("market_live"),
+            "dry_run": self.connector.dry_run,
+            "paused": self.paused,
+            "halted": bool(guard and guard.halted),
+            "halt_reason": guard.reason if guard else "",
+            "thresholds": {"buy": self.cfg.strategy.buy_threshold,
+                           "sell": self.cfg.strategy.sell_threshold},
+            "weights": {"yield": self.cfg.strategy.weight_yield,
+                        "dollar": self.cfg.strategy.weight_dxy,
+                        "silver": self.cfg.strategy.weight_silver,
+                        "trend": sum(self.cfg.trend.weights),
+                        "ai_news": self.cfg.ai_news.weight,
+                        "vwap": self.cfg.strategy.weight_vwap},
+            "controls": {"enabled": dash.allow_controls,
+                         "close_all": dash.allow_close_all},
+            "account": None,
+            "positions": [
+                {"ticket": p.ticket, "side": p.side, "volume": p.volume,
+                 "open": p.price_open, "sl": p.sl, "tp": p.tp, "profit": _num(p.profit)}
+                for p in ctx.get("positions", [])
+            ],
+            "news": None,
+            "ai": None,
+            "last_bar": self._last_bar_report or None,
+            "events": list(self._events),
+        }
+        if acc is not None:
+            status["account"] = {
+                "balance": acc.balance, "equity": acc.equity, "currency": acc.currency,
+                "demo": acc.is_demo,
+                "day_pl_pct": _num(-guard.daily_loss_pct * 100) if guard else None,
+            }
+        if ns is not None:
+            nxt = ns.next_event
+            status["news"] = {
+                "blackout": ns.blackout, "reason": ns.reason,
+                "next_event": (f"{nxt.currency} {nxt.title}" if nxt else None),
+                "next_event_time": nxt.time.isoformat() if nxt else None,
+            }
+        if ai is not None:
+            status["ai"] = {
+                "active": bool(self.sentiment and self.sentiment.active),
+                "sentiment": _num(ai.sentiment), "count": ai.relevant_count,
+                "score": ai.score, "top": ai.top, "error": ai.error,
+                "shock_active": ai.shock_active, "shock_headline": ai.shock_headline,
+                "shock_until": ai.shock_until.isoformat() if ai.shock_until else None,
+            }
+        with self._status_lock:
+            self._status = status
 
     def _journal(self, row: dict) -> None:
         path = Path(self.cfg.journal_file)

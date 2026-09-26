@@ -158,3 +158,94 @@ def test_h4_downtrend_blocks_buy(tmp_path, account):
     bot.step()
     assert not [s for s in conn.sent if s[0] == "open"]
     assert "against the higher-timeframe trend" in (tmp_path / "journal.csv").read_text()
+
+
+# --------------------------------------------------------------------------- #
+# Dashboard commands, AI shock pause and trend-reversal exits
+# --------------------------------------------------------------------------- #
+def opens(conn):
+    return [s for s in conn.sent if s[0] == "open"]
+
+
+def test_dashboard_pause_blocks_and_resume_allows(tmp_path, account):
+    bot, conn = build(tmp_path, account)
+    bot.submit_command("pause")
+    bot.step()
+    assert not opens(conn) and bot.status()["mode"] == "PAUSED"
+    assert "paused from dashboard" in (tmp_path / "journal.csv").read_text()
+
+    bot.submit_command("resume")
+    bot._last_bar = None
+    bot.step()
+    assert len(opens(conn)) == 1 and bot.status()["mode"] == "DRY-RUN"
+
+
+def test_dashboard_close_all_closes_and_pauses(tmp_path, account):
+    bot, conn = build(tmp_path, account)
+    conn.open_positions = [long_position(ticket=7)]
+    bot.submit_command("close_all")
+    bot.step()
+    assert ("close", 7, 0.10) in conn.sent
+    assert bot.paused
+    assert any("Closed 1 position" in e["text"] for e in bot.status()["events"])
+
+
+def test_status_is_json_safe(tmp_path, account):
+    import json
+    bot, conn = build(tmp_path, account)
+    conn.open_positions = [long_position()]
+    bot.step()
+    status = bot.status()
+    json.dumps(status, allow_nan=False)          # NaN would break the phone page
+    assert status["account"]["equity"] == 10_000.0
+    assert status["last_bar"]["parts"]["yield"] == 25
+    assert status["positions"][0]["side"] == "BUY"
+
+
+class ShockAI:
+    active = True
+
+    def __init__(self, shock=True):
+        from goldbot.sentiment_engine import SentimentSnapshot
+        self.snap = SentimentSnapshot(shock_active=shock,
+                                      shock_headline="Emergency Fed meeting called",
+                                      shock_until=NOW + timedelta(minutes=40))
+
+    def snapshot(self):
+        return self.snap
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+
+def test_ai_shock_pauses_entries_and_protects_trades(tmp_path, account):
+    bot, conn = build(tmp_path, account)
+    bot.sentiment = ShockAI()
+    conn.open_positions = [long_position(price_open=2640.0, sl=2630.0)]
+    bot.cfg.execution.max_open_positions = 2
+    bot.step()
+    assert not opens(conn)
+    assert "AI shock pause" in (tmp_path / "journal.csv").read_text()
+    assert [s for s in conn.sent if s[0] == "modify"]       # winner -> breakeven
+    bot._last_bar = None
+    bot.step()                                              # protected only once
+    assert len([s for s in conn.sent if s[0] == "modify"]) == 1
+
+
+def test_h1_trend_reversal_closes_trade(tmp_path, account):
+    rates = {("XAUUSD", "H4"): trend_bars(1.5, 240), ("XAUUSD", "H1"): trend_bars(-1.5, 60)}
+    bot, conn = build(tmp_path, account, extra_rates=rates)
+    conn.open_positions = [long_position(ticket=9)]
+    bot.step()
+    assert ("close", 9, 0.10) in conn.sent
+    assert any("Trend exit" in e["text"] for e in bot.status()["events"])
+
+
+def test_ranging_h1_does_not_close_trade(tmp_path, account):
+    bot, conn = build(tmp_path, account)            # no H1 data -> RANGE
+    conn.open_positions = [long_position(ticket=9)]
+    bot.step()
+    assert not [s for s in conn.sent if s[0] == "close"]

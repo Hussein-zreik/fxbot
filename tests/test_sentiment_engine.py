@@ -47,11 +47,11 @@ def test_same_story_from_two_outlets_is_one_headline():
 
 def test_llm_reply_parsed_and_clamped():
     heads = parse_feed(rss([("A", NOW), ("B", NOW)]), NOW)
-    reply = ('Sure! {"scores": [{"i": 0, "impact": 3, "relevance": 0.9},'
+    reply = ('Sure! {"scores": [{"i": 0, "impact": 3, "relevance": 0.9, "shock": 2},'
              ' {"i": 1, "impact": -0.4, "relevance": -1}, {"i": 7, "impact": 1}]}')
     out = LLMHeadlineScorer._parse(reply, heads)
-    assert out[heads[0].hid] == (1.0, 0.9)
-    assert out[heads[1].hid] == (-0.4, 0.0)
+    assert out[heads[0].hid] == (1.0, 0.9, 1.0)
+    assert out[heads[1].hid] == (-0.4, 0.0, 0.0)   # missing shock -> 0
     assert len(out) == 2
 
 
@@ -156,7 +156,8 @@ def test_real_client_request_shape(tmp_path):
     assert sent["headers"]["Authorization"] == "Bearer k-123"
     assert sent["body"]["response_format"] == {"type": "json_object"}
     assert "0. Gold rallies" in sent["body"]["messages"][1]["content"]
-    assert out[heads[0].hid] == (0.5, 1.0)
+    assert out[heads[0].hid] == (0.5, 1.0, 0.0)
+    assert '"shock"' in sent["body"]["messages"][1]["content"]
 
 
 def test_rate_limit_raises_clear_error():
@@ -172,3 +173,33 @@ def test_cache_file_is_json(tmp_path):
     eng.refresh()
     data = json.loads((tmp_path / "s.json").read_text())
     assert len(data) == 4
+
+
+def test_shock_headline_pauses_for_an_hour(tmp_path):
+    items = BULLISH + [("War breaks out in major oil region", NOW - timedelta(minutes=15))]
+    table = dict(TABLE)
+    table["War breaks out in major oil region"] = (0.9, 1.0, 0.95)
+    eng, _ = make_engine(tmp_path, rss(items), table)
+    eng.refresh()
+    snap = eng.snapshot()
+    assert snap.shock_active and "War breaks out" in snap.shock_headline
+    assert snap.shock_until == NOW + timedelta(minutes=45)
+
+    later, _ = make_engine(tmp_path, rss(items), table, now=NOW + timedelta(minutes=50))
+    assert not later.snapshot().shock_active       # pause expired
+
+
+def test_irrelevant_shock_is_ignored(tmp_path):
+    items = BULLISH + [("Earthquake cancels football final", NOW - timedelta(minutes=5))]
+    table = dict(TABLE)
+    table["Earthquake cancels football final"] = (0.0, 0.1, 1.0)
+    eng, _ = make_engine(tmp_path, rss(items), table)
+    eng.refresh()
+    assert not eng.snapshot().shock_active
+
+
+def test_old_cache_without_shock_field_still_works(tmp_path):
+    (tmp_path / "s.json").write_text(json.dumps({"abc": {
+        "title": "Old", "published": NOW.isoformat(), "impact": 0.5, "relevance": 0.9}}))
+    eng, _ = make_engine(tmp_path, rss([]), {})
+    assert not eng.snapshot().shock_active

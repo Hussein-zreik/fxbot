@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="GoldBot">
+<meta name="theme-color" content="#111318">
+<title>GoldBot</title>
+<style nonce="{{NONCE}}">
+:root {
+  --bg: #f4f5f7; --card: #ffffff; --text: #16181d; --muted: #6b7280;
+  --line: #e5e7eb; --track: #eceef1; --gold: #b7862b;
+  --up: #15803d; --up-bg: #dcfce7; --down: #b91c1c; --down-bg: #fee2e2;
+  --warn: #a16207; --warn-bg: #fef3c7; --info: #1d4ed8; --info-bg: #dbeafe;
+  --shadow: 0 1px 2px rgba(0,0,0,.06), 0 1px 8px rgba(0,0,0,.04);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d0f13; --card: #171a21; --text: #eef0f4; --muted: #9aa3b2;
+    --line: #262a33; --track: #232733; --gold: #e0b252;
+    --up: #4ade80; --up-bg: #0f2e1b; --down: #f87171; --down-bg: #3a1414;
+    --warn: #fbbf24; --warn-bg: #3a2c0a; --info: #93c5fd; --info-bg: #13233f;
+    --shadow: none;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+  -webkit-text-size-adjust: 100%; }
+body { padding: calc(env(safe-area-inset-top) + 12px) 16px
+  calc(env(safe-area-inset-bottom) + 24px); max-width: 560px; margin: 0 auto; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  margin-bottom: 12px; }
+h1 { font-size: 20px; margin: 0; letter-spacing: -.01em; }
+h1 span { color: var(--gold); }
+h2 { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--muted); margin: 0 0 10px; }
+.card { background: var(--card); border-radius: 16px; padding: 14px 16px;
+  margin-bottom: 12px; box-shadow: var(--shadow); border: 1px solid var(--line); }
+.pill { font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 999px;
+  letter-spacing: .04em; white-space: nowrap; }
+.pill.LIVE { background: var(--up-bg); color: var(--up); }
+.pill.DRY-RUN { background: var(--info-bg); color: var(--info); }
+.pill.PAUSED { background: var(--warn-bg); color: var(--warn); }
+.pill.HALTED, .pill.DISCONNECTED, .pill.OFFLINE { background: var(--down-bg); color: var(--down); }
+.sub { color: var(--muted); font-size: 13px; }
+.row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.big { font-size: 30px; font-weight: 700; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+.num { font-variant-numeric: tabular-nums; }
+.pos { color: var(--up); } .neg { color: var(--down); }
+.banner { border-radius: 12px; padding: 10px 12px; margin-bottom: 12px; font-size: 14px;
+  font-weight: 600; }
+.banner.red { background: var(--down-bg); color: var(--down); }
+.banner.amber { background: var(--warn-bg); color: var(--warn); }
+.hidden { display: none !important; }
+/* score gauge */
+.gauge { position: relative; height: 12px; background: var(--track); border-radius: 6px;
+  margin: 14px 0 6px; }
+.gauge .zone { position: absolute; top: 0; bottom: 0; }
+.gauge .zone.sell { left: 0; width: 20%; background: var(--down-bg); border-radius: 6px 0 0 6px; }
+.gauge .zone.buy { right: 0; width: 20%; background: var(--up-bg); border-radius: 0 6px 6px 0; }
+.gauge .needle { position: absolute; top: -5px; width: 4px; height: 22px; border-radius: 2px;
+  background: var(--text); transform: translateX(-2px); transition: left .4s ease; }
+.gauge-labels { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
+.parts { margin-top: 12px; }
+.part { display: grid; grid-template-columns: 74px 1fr 38px; align-items: center; gap: 8px;
+  padding: 4px 0; font-size: 14px; }
+.part .bar { position: relative; height: 8px; background: var(--track); border-radius: 4px; }
+.part .bar::after { content: ""; position: absolute; left: 50%; top: -2px; bottom: -2px;
+  width: 1px; background: var(--muted); opacity: .5; }
+.part .fill { position: absolute; top: 0; bottom: 0; border-radius: 4px; }
+.part .fill.pos { background: var(--up); } .part .fill.neg { background: var(--down); }
+.part .val { text-align: right; font-weight: 600; }
+.action { margin-top: 10px; font-size: 13px; color: var(--muted); word-break: break-word; }
+.chips { display: flex; gap: 8px; flex-wrap: wrap; }
+.chip { padding: 6px 10px; border-radius: 10px; font-weight: 600; font-size: 14px;
+  background: var(--track); }
+.chip.up { background: var(--up-bg); color: var(--up); }
+.chip.down { background: var(--down-bg); color: var(--down); }
+.chip small { font-weight: 400; opacity: .8; }
+ul.list { list-style: none; margin: 0; padding: 0; }
+ul.list li { padding: 8px 0; border-top: 1px solid var(--line); font-size: 14px; }
+ul.list li:first-child { border-top: 0; }
+.tag { display: inline-block; min-width: 38px; text-align: center; font-weight: 700;
+  font-size: 12px; border-radius: 6px; padding: 1px 6px; margin-right: 6px; }
+.tag.pos { background: var(--up-bg); } .tag.neg { background: var(--down-bg); }
+.tag.zero { background: var(--track); color: var(--muted); }
+.position .row { font-weight: 600; }
+.grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; margin-top: 4px;
+  font-size: 12px; color: var(--muted); }
+.controls { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+button { font: inherit; font-weight: 600; border: 0; border-radius: 12px; padding: 13px 12px;
+  cursor: pointer; background: var(--track); color: var(--text); }
+button.primary { background: var(--gold); color: #111; }
+button.danger { background: var(--down); color: #fff; }
+button:disabled { opacity: .45; }
+input { font: inherit; width: 100%; padding: 12px; border-radius: 12px; border: 1px solid var(--line);
+  background: var(--bg); color: var(--text); margin: 8px 0 12px; }
+.linkish { background: none; padding: 6px 0; color: var(--muted); font-weight: 400; font-size: 13px; }
+.note { margin-top: 8px; }
+.toast { position: fixed; left: 16px; right: 16px; bottom: calc(env(safe-area-inset-bottom) + 16px);
+  max-width: 528px; margin: 0 auto; background: var(--text); color: var(--bg); padding: 12px 14px;
+  border-radius: 12px; font-size: 14px; opacity: 0; transition: opacity .25s; pointer-events: none; }
+.toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>&#9679;</span> GoldBot</h1>
+  <div class="row"><span class="sub" id="updated"></span><span class="pill OFFLINE" id="mode">…</span></div>
+</header>
+
+<!-- Login -->
+<section class="card hidden" id="login">
+  <h2>Connect</h2>
+  <div class="sub">Enter the dashboard token (the DASHBOARD_TOKEN value set on the VPS). It stays on this phone only.</div>
+  <input id="tokenInput" type="password" autocomplete="current-password" placeholder="Dashboard token">
+  <button class="primary" id="saveToken">Connect</button>
+</section>
+
+<main id="app" class="hidden">
+  <div class="banner red hidden" id="bannerShock"></div>
+  <div class="banner red hidden" id="bannerHalt"></div>
+  <div class="banner amber hidden" id="bannerNews"></div>
+  <div class="banner amber hidden" id="bannerOffline"></div>
+
+  <section class="card">
+    <h2>Account</h2>
+    <div class="row"><div class="big num" id="equity">–</div><div class="num" id="daypl">–</div></div>
+    <div class="sub" id="accountSub"></div>
+  </section>
+
+  <section class="card">
+    <h2>Signal score</h2>
+    <div class="row"><div class="big num" id="score">–</div><div class="sub" id="barTime"></div></div>
+    <div class="gauge"><div class="zone sell"></div><div class="zone buy"></div><div class="needle" id="needle"></div></div>
+    <div class="gauge-labels"><span>SELL −100</span><span>0</span><span>+100 BUY</span></div>
+    <div class="parts" id="parts"></div>
+    <div class="action" id="action"></div>
+  </section>
+
+  <section class="card">
+    <h2>Trend</h2>
+    <div class="chips" id="trend"></div>
+  </section>
+
+  <section class="card">
+    <h2>AI news</h2>
+    <div class="row"><div class="num" id="aiSentiment">–</div><div class="sub" id="aiCount"></div></div>
+    <ul class="list" id="headlines"></ul>
+  </section>
+
+  <section class="card">
+    <h2>Economic calendar</h2>
+    <div id="calendar" class="num">–</div>
+  </section>
+
+  <section class="card">
+    <h2>Open positions</h2>
+    <ul class="list" id="positions"></ul>
+  </section>
+
+  <section class="card" id="controlsCard">
+    <h2>Controls</h2>
+    <div class="controls">
+      <button class="primary" id="pauseBtn">Pause trading</button>
+      <button class="danger" id="closeBtn">Close all</button>
+    </div>
+    <div class="sub note" id="controlsNote">Commands apply within ~10 seconds. Close all also pauses the bot.</div>
+  </section>
+
+  <section class="card">
+    <h2>Recent activity</h2>
+    <ul class="list" id="events"></ul>
+  </section>
+
+  <button class="linkish" id="forget">Forget token on this phone</button>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script nonce="{{NONCE}}">
+(function () {
+  "use strict";
+  var KEY = "goldbot_token";
+  var LABELS = { yield: "Yields", dollar: "Dollar", silver: "Silver", trend: "Trend",
+                 ai_news: "AI news", vwap: "VWAP" };
+  var token = "";
+  var last = null;
+  var timer = null;
+
+  function $(id) { return document.getElementById(id); }
+  function el(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined && text !== null) n.textContent = String(text);  // never innerHTML
+    return n;
+  }
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+  function show(node, on) { node.classList.toggle("hidden", !on); }
+  function money(v, cur) {
+    if (v === null || v === undefined) return "–";
+    return v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) +
+      (cur ? " " + cur : "");
+  }
+  function signed(v, digits) {
+    if (v === null || v === undefined) return "–";
+    return (v > 0 ? "+" : "") + v.toFixed(digits === undefined ? 0 : digits);
+  }
+  function ago(iso) {
+    if (!iso) return "";
+    var s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+    return s < 60 ? s + "s ago" : Math.round(s / 60) + "m ago";
+  }
+  function hhmm(iso) {
+    if (!iso) return "";
+    var d = new Date(iso);
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+  function toast(msg) {
+    var t = $("toast"); t.textContent = msg; t.classList.add("show");
+    setTimeout(function () { t.classList.remove("show"); }, 3500);
+  }
+  function storeGet() { try { return localStorage.getItem(KEY) || ""; } catch (e) { return ""; } }
+  function storeSet(v) { try { v ? localStorage.setItem(KEY, v) : localStorage.removeItem(KEY); } catch (e) {} }
+
+  // ------------------------------------------------------------------ API
+  function api(path, opts) {
+    opts = opts || {};
+    opts.headers = Object.assign({ "Authorization": "Bearer " + token }, opts.headers || {});
+    opts.cache = "no-store";
+    return fetch(path, opts).then(function (r) {
+      if (r.status === 401) { throw { auth: true }; }
+      return r.json().then(function (body) {
+        if (!r.ok) throw { message: body.error || ("HTTP " + r.status) };
+        return body;
+      });
+    });
+  }
+
+  function refresh() {
+    api("/api/status").then(function (s) {
+      last = s; render(s); show($("bannerOffline"), false);
+    }).catch(function (err) {
+      if (err && err.auth) { logout("Token rejected - please re-enter it."); return; }
+      $("mode").className = "pill OFFLINE"; $("mode").textContent = "OFFLINE";
+      $("bannerOffline").textContent = "Can't reach the bot. Check Tailscale is connected on this phone and the bot is running.";
+      show($("bannerOffline"), true);
+    });
+  }
+
+  function command(action, confirmWord) {
+    var body = { action: action };
+    if (confirmWord) body.confirm = confirmWord;
+    return api("/api/command", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body) })
+      .then(function (r) { toast(r.message || "Sent"); setTimeout(refresh, 1500); })
+      .catch(function (e) { toast("Failed: " + (e.message || "error")); });
+  }
+
+  // ------------------------------------------------------------------ render
+  function render(s) {
+    $("mode").className = "pill " + s.mode; $("mode").textContent = s.mode;
+    $("updated").textContent = ago(s.updated);
+
+    // Banners
+    var ai = s.ai || {};
+    show($("bannerShock"), !!ai.shock_active);
+    if (ai.shock_active) $("bannerShock").textContent =
+      "⚠ AI shock pause until " + hhmm(ai.shock_until) + ": " + (ai.shock_headline || "");
+    show($("bannerHalt"), !!s.halted);
+    if (s.halted) $("bannerHalt").textContent = "Daily loss limit hit - " + s.halt_reason;
+    var news = s.news || {};
+    show($("bannerNews"), !!news.blackout);
+    if (news.blackout) $("bannerNews").textContent = "News blackout: " + news.reason;
+
+    // Account
+    var a = s.account;
+    if (a) {
+      $("equity").textContent = money(a.equity, a.currency);
+      var pl = a.day_pl_pct;
+      $("daypl").textContent = pl === null || pl === undefined ? "–" : signed(pl, 2) + "% today";
+      $("daypl").className = "num " + (pl > 0 ? "pos" : pl < 0 ? "neg" : "");
+      $("accountSub").textContent = "Balance " + money(a.balance, a.currency) + " · " +
+        (a.demo ? "Demo" : "Real") + " account · " + (s.symbol || "") +
+        (s.market_live === false ? " · market closed" : "");
+    }
+
+    // Score
+    var b = s.last_bar;
+    clear($("parts"));
+    if (b) {
+      $("score").textContent = signed(b.total);
+      $("score").className = "big num " + (b.total >= s.thresholds.buy ? "pos" :
+        b.total <= s.thresholds.sell ? "neg" : "");
+      $("barTime").textContent = "bar " + hhmm(b.bar_time);
+      $("needle").style.left = ((b.total + 100) / 2) + "%";
+      Object.keys(LABELS).forEach(function (k) {
+        var v = (b.parts || {})[k] || 0, max = (s.weights || {})[k] || 1;
+        var row = el("div", "part");
+        row.appendChild(el("span", "", LABELS[k]));
+        var bar = el("div", "bar"), fill = el("div", "fill " + (v >= 0 ? "pos" : "neg"));
+        var w = Math.min(50, Math.abs(v) / max * 50);
+        fill.style.width = w + "%";
+        fill.style.left = v >= 0 ? "50%" : (50 - w) + "%";
+        bar.appendChild(fill); row.appendChild(bar);
+        row.appendChild(el("span", "val num " + (v > 0 ? "pos" : v < 0 ? "neg" : ""), signed(v)));
+        $("parts").appendChild(row);
+      });
+      $("action").textContent = b.action || "";
+    } else {
+      $("score").textContent = "–";
+      $("action").textContent = "Waiting for the first closed 5-minute bar…";
+    }
+
+    // Trend
+    clear($("trend"));
+    var frames = (b && b.trend) || [];
+    if (!frames.length) $("trend").appendChild(el("span", "sub", "No trend data yet"));
+    frames.forEach(function (f) {
+      var name = f.dir > 0 ? "UP" : f.dir < 0 ? "DOWN" : "RANGE";
+      var chip = el("span", "chip " + (f.dir > 0 ? "up" : f.dir < 0 ? "down" : ""), f.tf + " " + name + " ");
+      chip.appendChild(el("small", "", f.adx === null ? "" : "ADX " + Math.round(f.adx)));
+      $("trend").appendChild(chip);
+    });
+
+    // AI news
+    clear($("headlines"));
+    if (!ai.active) {
+      $("aiSentiment").textContent = "Inactive";
+      $("aiCount").textContent = "set GROQ_API_KEY on the VPS";
+    } else {
+      $("aiSentiment").textContent = ai.sentiment === null ? "Not enough news" :
+        "Sentiment " + signed(ai.sentiment, 2) + "  (" + signed(ai.score) + " pts)";
+      $("aiSentiment").className = "num " + (ai.sentiment > 0 ? "pos" : ai.sentiment < 0 ? "neg" : "");
+      $("aiCount").textContent = ai.count + " relevant" + (ai.error ? " · API issue" : "");
+      (ai.top || []).forEach(function (line) {
+        var m = /^([+-]?\d+(?:\.\d+)?)\s(.*)$/.exec(line);
+        var li = el("li");
+        if (m) {
+          var v = parseFloat(m[1]);
+          li.appendChild(el("span", "tag " + (v > 0 ? "pos" : v < 0 ? "neg" : "zero"), m[1]));
+          li.appendChild(document.createTextNode(m[2]));
+        } else { li.textContent = line; }
+        $("headlines").appendChild(li);
+      });
+    }
+
+    // Calendar
+    if (news.next_event) {
+      var mins = Math.round((new Date(news.next_event_time).getTime() - Date.now()) / 60000);
+      var when = mins <= 0 ? "now" :
+        "in " + (mins >= 60 ? Math.floor(mins / 60) + "h " + (mins % 60) + "m" : mins + "m");
+      $("calendar").textContent = "Next: " + news.next_event + " at " + hhmm(news.next_event_time) +
+        " (" + when + ")";
+    } else {
+      $("calendar").textContent = news.reason ? news.reason : "No high-impact USD events ahead this week";
+    }
+
+    // Positions
+    clear($("positions"));
+    if (!s.positions.length) $("positions").appendChild(el("li", "sub", "No open bot positions"));
+    s.positions.forEach(function (p) {
+      var li = el("li", "position");
+      var top = el("div", "row");
+      top.appendChild(el("span", p.side === "BUY" ? "pos" : "neg", p.side + " " + p.volume + " @ " + p.open));
+      top.appendChild(el("span", "num " + (p.profit >= 0 ? "pos" : "neg"),
+        money(p.profit, s.account ? s.account.currency : "")));
+      li.appendChild(top);
+      var g = el("div", "grid3");
+      g.appendChild(el("span", "", "SL " + (p.sl || "–")));
+      g.appendChild(el("span", "", "TP " + (p.tp || "–")));
+      g.appendChild(el("span", "", "#" + p.ticket));
+      li.appendChild(g);
+      $("positions").appendChild(li);
+    });
+
+    // Controls
+    var c = s.controls || {};
+    show($("controlsCard"), !!(c.enabled || c.close_all));
+    $("pauseBtn").textContent = s.paused ? "Resume trading" : "Pause trading";
+    $("pauseBtn").disabled = !c.enabled || !s.connected;
+    $("closeBtn").disabled = !c.close_all || !s.connected || !s.positions.length;
+    show($("closeBtn"), !!c.close_all);
+
+    // Events
+    clear($("events"));
+    if (!s.events.length) $("events").appendChild(el("li", "sub", "Nothing yet"));
+    s.events.slice(0, 12).forEach(function (e) {
+      var li = el("li");
+      li.appendChild(el("span", "sub", hhmm(e.time) + "  "));
+      li.appendChild(document.createTextNode(e.text));
+      $("events").appendChild(li);
+    });
+  }
+
+  // ------------------------------------------------------------------ session
+  function login() {
+    show($("login"), false); show($("app"), true);
+    refresh();
+    clearInterval(timer);
+    timer = setInterval(function () {
+      if (!document.hidden) refresh();
+      else if (last) $("updated").textContent = ago(last.updated);
+    }, 5000);
+  }
+  function logout(msg) {
+    clearInterval(timer); token = ""; storeSet("");
+    show($("app"), false); show($("login"), true);
+    if (msg) toast(msg);
+  }
+
+  $("saveToken").addEventListener("click", function () {
+    var v = $("tokenInput").value.trim();
+    if (!v) return;
+    token = v; storeSet(v); $("tokenInput").value = ""; login();
+  });
+  $("tokenInput").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") $("saveToken").click();
+  });
+  $("forget").addEventListener("click", function () { logout("Token removed from this phone."); });
+  $("pauseBtn").addEventListener("click", function () {
+    command(last && last.paused ? "resume" : "pause");
+  });
+  $("closeBtn").addEventListener("click", function () {
+    var word = window.prompt("This closes ALL bot positions at market and pauses the bot.\nType CLOSE to confirm:");
+    if (word === "CLOSE") command("close_all", "CLOSE");
+    else if (word !== null) toast("Cancelled - you must type CLOSE exactly.");
+  });
+  document.addEventListener("visibilitychange", function () { if (!document.hidden && token) refresh(); });
+
+  token = storeGet();
+  if (token) login(); else show($("login"), true);
+})();
+</script>
+</body>
+</html>

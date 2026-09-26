@@ -15,6 +15,12 @@ The score is a time-decayed, relevance-weighted average of the ratings:
     sentiment = sum(weight_i * impact_i) / sum(weight_i)          (-1 .. +1)
     points    = round(sentiment * weight)   if |sentiment| >= deadband
 
+Shock detector: the model also rates each headline's "shock" (0..1), meaning
+how sudden, unscheduled and market-moving it is (war outbreak, emergency Fed
+action, major default...). Scheduled data releases are NOT shocks; the
+calendar blackout already handles those. A relevant headline with shock >=
+``shock_threshold`` pauses new entries for ``shock_pause_minutes``.
+
 Headlines are untrusted text. They are passed to the model as data, the
 model's output is parsed strictly and clamped, and the block can move the
 total score by at most ``weight`` points, so a strange headline can never
@@ -52,9 +58,13 @@ _SYSTEM_PROMPT = (
 
 _USER_TEMPLATE = (
     'Rate each headline. Return exactly: {{"scores": [{{"i": <index>, '
-    '"impact": <number -1..1>, "relevance": <number 0..1>}}, ...]}}\n'
+    '"impact": <number -1..1>, "relevance": <number 0..1>, '
+    '"shock": <number 0..1>}}, ...]}}\n'
     "impact: +1 strongly bullish for gold, -1 strongly bearish, 0 neutral.\n"
-    "relevance: 0 = unrelated to gold, 1 = directly moves gold.\n\n"
+    "relevance: 0 = unrelated to gold, 1 = directly moves gold.\n"
+    "shock: 1 = sudden, unscheduled, market-moving event (war outbreak, "
+    "terror attack, emergency central-bank action, surprise default); "
+    "0 = routine news. Scheduled data releases and commentary are 0.\n\n"
     "Headlines:\n{lines}"
 )
 
@@ -74,6 +84,9 @@ class SentimentSnapshot:
     last_refresh: Optional[datetime] = None
     error: str = ""
     top: List[str] = field(default_factory=list)   # most influential headlines
+    shock_active: bool = False
+    shock_headline: str = ""
+    shock_until: Optional[datetime] = None
     notes: List[str] = field(default_factory=list)
 
 
@@ -138,7 +151,7 @@ class LLMHeadlineScorer:
         self._post = http_post
 
     def score(self, headlines: List[Headline]) -> Dict[str, tuple]:
-        """Return {headline_id: (impact, relevance)}; raises on API errors."""
+        """Return {headline_id: (impact, relevance, shock)}; raises on API errors."""
         lines = "\n".join(f"{i}. {h.title[:300]}" for i, h in enumerate(headlines))
         body = {
             "model": self.cfg.model,
@@ -172,10 +185,11 @@ class LLMHeadlineScorer:
                 i = int(row["i"])
                 impact = max(-1.0, min(1.0, float(row["impact"])))
                 relevance = max(0.0, min(1.0, float(row["relevance"])))
-            except (KeyError, TypeError, ValueError):
+                shock = max(0.0, min(1.0, float(row.get("shock", 0.0))))
+            except (KeyError, TypeError, ValueError, AttributeError):
                 continue
             if 0 <= i < len(headlines):
-                out[headlines[i].hid] = (impact, relevance)
+                out[headlines[i].hid] = (impact, relevance, shock)
         return out
 
 
@@ -282,10 +296,11 @@ class SentimentEngine:
                 break
             with self._lock:
                 for h in batch:
-                    impact, relevance = scores.get(h.hid, (0.0, 0.0))
+                    impact, relevance, *rest = scores.get(h.hid, (0.0, 0.0, 0.0))
                     self._cache[h.hid] = {"title": h.title,
                                           "published": h.published.isoformat(),
-                                          "impact": impact, "relevance": relevance}
+                                          "impact": impact, "relevance": relevance,
+                                          "shock": rest[0] if rest else 0.0}
 
         with self._lock:
             keep_after = now - timedelta(hours=self.cfg.lookback_hours * 2)
@@ -309,6 +324,7 @@ class SentimentEngine:
         weighted, total_w, influence = 0.0, 0.0, []
         with self._lock:
             rows = list(self._cache.values())
+        self._detect_shock(rows, now, snap)
         for row in rows:
             published = datetime.fromisoformat(row["published"])
             if published < cutoff or row["relevance"] < self.cfg.min_relevance:
@@ -330,3 +346,20 @@ class SentimentEngine:
             snap.score = int(round(snap.sentiment * self.cfg.weight))
             snap.notes.append(f"AI news sentiment {snap.sentiment:+.2f}")
         return snap
+
+    def _detect_shock(self, rows: List[dict], now: datetime,
+                      snap: SentimentSnapshot) -> None:
+        if not self.cfg.shock_enabled:
+            return
+        pause = timedelta(minutes=self.cfg.shock_pause_minutes)
+        for row in rows:
+            if (row.get("shock", 0.0) < self.cfg.shock_threshold
+                    or row["relevance"] < self.cfg.shock_min_relevance):
+                continue
+            until = datetime.fromisoformat(row["published"]) + pause
+            if until > now and (snap.shock_until is None or until > snap.shock_until):
+                snap.shock_active = True
+                snap.shock_until = until
+                snap.shock_headline = row["title"]
+        if snap.shock_active:
+            snap.notes.append(f"AI SHOCK: {snap.shock_headline[:80]}")

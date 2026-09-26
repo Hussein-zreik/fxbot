@@ -89,6 +89,9 @@ class TrendConfig:
     swing_strength: int = 3         # bars each side that define a swing point
     # Filter: block trades against the trend of this timeframe ("" disables).
     filter_timeframe: str = "H4"
+    # Close an open trade when this timeframe's trend flips against it.
+    exit_on_reversal: bool = True
+    exit_timeframe: str = "H1"
     bars: int = 400
 
 
@@ -117,6 +120,23 @@ class SentimentConfig:
     max_new_per_refresh: int = 60    # protects the free-tier quota
     request_timeout_s: float = 30.0
     cache_file: str = "data/sentiment_cache.json"
+    # Shock detector: sudden, unscheduled market-moving events.
+    shock_enabled: bool = True
+    shock_threshold: float = 0.8     # AI "shock" rating 0..1 that triggers a pause
+    shock_min_relevance: float = 0.5
+    shock_pause_minutes: int = 60    # no new trades for this long after the headline
+    shock_protect_positions: bool = True  # breakeven / halve open trades like news
+
+
+@dataclass
+class DashboardConfig:
+    """Phone dashboard (served locally; reach it privately through Tailscale)."""
+    enabled: bool = True
+    host: str = "127.0.0.1"
+    port: int = 8765
+    token_env: str = "DASHBOARD_TOKEN"   # secret token read from this env var
+    allow_controls: bool = True          # pause / resume buttons
+    allow_close_all: bool = True         # "close all positions" button
 
 
 @dataclass
@@ -178,6 +198,7 @@ class AppConfig:
     news: NewsConfig = field(default_factory=NewsConfig)
     trend: TrendConfig = field(default_factory=TrendConfig)
     ai_news: SentimentConfig = field(default_factory=SentimentConfig)
+    dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     log_dir: str = "logs"
@@ -222,6 +243,8 @@ def _validate(cfg: AppConfig) -> None:
         raise ValueError("trend.timeframes and trend.weights must have equal length")
     if t.filter_timeframe and t.filter_timeframe not in t.timeframes:
         raise ValueError("trend.filter_timeframe must be one of trend.timeframes")
+    if t.exit_on_reversal and t.exit_timeframe not in t.timeframes:
+        raise ValueError("trend.exit_timeframe must be one of trend.timeframes")
     if t.ema_fast >= t.ema_slow:
         raise ValueError("trend.ema_fast must be smaller than trend.ema_slow")
     for d in e.trade_weekdays:

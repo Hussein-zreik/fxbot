@@ -43,6 +43,16 @@ Every weight is editable in the config.
 - Spread too wide (default 60 points = $0.60).
 - Daily loss guardrail triggered.
 
+**AI shock pause:**
+- The AI also gives each headline a "shock" rating: how sudden and unscheduled the event is (war, emergency Fed action, surprise default).
+- A relevant headline rated 0.8 or higher pauses new trades for 60 minutes.
+- Open trades are protected the same way as before news: breakeven if winning, cut in half if losing.
+- Scheduled data releases don't count as shocks. The calendar blackout already covers them.
+
+**Trend-reversal exit:** at each new 5-minute bar, a BUY is closed if the H1
+trend has turned DOWN, and a SELL if it has turned UP. A ranging H1 doesn't
+close anything. Switch it off with `trend.exit_on_reversal`.
+
 **Before high-impact news, for open trades:**
 - **In profit** → SL moves to breakeven + 10 points.
 - **Losing** → 50% of the position is closed.
@@ -79,13 +89,14 @@ goldbot/
   correlation_engine.py    CorrelationEngine – gold/silver/USD breakouts, correlation, divergence
   technical_engine.py      TechnicalEngine – session VWAP (00:00 UTC anchor), ATR
   trend_engine.py          TrendEngine – H4/H1 EMA50/200, ADX, swing structure, trend filter
-  sentiment_engine.py      SentimentEngine – RSS headlines scored by an AI model (Groq), cached
+  sentiment_engine.py      SentimentEngine – RSS headlines scored by an AI model (Groq), shock detector
+  dashboard.py / .html     Phone dashboard – token-protected web page + JSON API (stdlib only)
   signal_model.py          score combination and entry decision
   risk_manager.py          RiskManager – sizing, SL/TP, daily guardrail
   orchestrator.py          BotOrchestrator – 10-second main loop, news management, journal
   indicators.py            pure indicator functions
   state.py                 crash-safe persistent state (data/state.json)
-tests/                     67 tests using a fake MT5 connector (run anywhere)
+tests/                     84 tests using a fake MT5 connector (run anywhere)
 ```
 
 ---
@@ -199,6 +210,40 @@ pip install -r requirements.txt
     - Paste it into the desktop terminal: Tools → Options → Notifications, tick *Enable Push Notifications*, and enable trade-transaction notifications if your build shows the option.
 23. For full log access, use Remote Desktop from the iPhone to the VPS.
 
+### F. Live phone dashboard (via Tailscale)
+The bot serves a live dashboard page that you open on your iPhone. It shows:
+- equity and today's P/L
+- the score with all six blocks, and the H4/H1 trend
+- AI sentiment with its top headlines, and any shock alert
+- the next calendar event, open positions and recent activity
+
+It also has **Pause/Resume** and **Close all** buttons.
+
+It is private: the bot only listens on the VPS itself (`127.0.0.1`), and
+**Tailscale** creates an encrypted link that only your own devices can use.
+No firewall ports are opened.
+
+24. **Create a dashboard token** (a long random password) on the VPS:
+    ```bat
+    python -c "import secrets; print(secrets.token_urlsafe(24))"
+    setx DASHBOARD_TOKEN "paste-the-generated-value"
+    ```
+    Reopen the terminal and restart the bot. The log should show `Dashboard on http://127.0.0.1:8765`. Without a token of at least 16 characters, the dashboard stays off.
+25. **Install Tailscale** (free) on the VPS from tailscale.com/download and sign in.
+26. **Install Tailscale on your iPhone** (App Store), sign in with the **same account**, and switch it on.
+27. **Publish the dashboard to your private network.** On the VPS, run this once in an admin terminal:
+    ```bat
+    tailscale serve --bg 8765
+    ```
+    It prints an address like `https://your-vps.tailXXXX.ts.net`. It stays on after reboots. If your Tailscale version rejects the command, run `tailscale serve --help` for the current syntax.
+28. **On the iPhone,** open that address in Safari and enter the token. Then tap *Share → Add to Home Screen* so it opens like an app.
+29. **Using it:**
+    - The page refreshes every 5 seconds.
+    - **Pause trading** stops new entries. Open trades keep their SL/TP.
+    - **Close all** closes every bot position at market and also pauses. You must type `CLOSE` to confirm.
+    - Commands run within about 10 seconds.
+    - To remove the buttons, set `dashboard.allow_controls` / `dashboard.allow_close_all` to `false`.
+
 ---
 
 ## 5. Configuration reference (most-used keys)
@@ -219,6 +264,11 @@ pip install -r requirements.txt
 | `ai_news.weight` | `10` | Maximum points from AI headline sentiment |
 | `ai_news.model` | `llama-3.3-70b-versatile` | Groq model name |
 | `ai_news.feeds` | Google News + FXStreet | Any RSS/Atom feed URLs |
+| `ai_news.shock_threshold` | `0.8` | AI shock rating that pauses new trades |
+| `ai_news.shock_pause_minutes` | `60` | Length of the shock pause |
+| `trend.exit_on_reversal` | `true` | Close trades when the H1 trend flips against them |
+| `dashboard.port` | `8765` | Local port for the phone dashboard |
+| `dashboard.allow_close_all` | `true` | Show the Close-all button |
 | `strategy.yield_trigger_bp` | `2.0` | Basis points in 15 min |
 | `strategy.min_correlation` | `0.6` | Gold/silver return correlation needed for confluence |
 | `risk.risk_per_trade` | `0.01` | 1% of equity |
@@ -249,6 +299,6 @@ pip install -r requirements.txt
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q        # 67 tests, no MT5 needed
+python -m pytest -q        # 84 tests, no MT5 needed
 python -m flake8 --max-line-length 100 goldbot run_bot.py tests
 ```

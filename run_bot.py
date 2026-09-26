@@ -9,6 +9,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from goldbot.config import AppConfig, load_config
+from goldbot.dashboard import DashboardServer
 from goldbot.macro_engine import MacroDataEngine
 from goldbot.mt5_connector import MT5Connector
 from goldbot.news_filter import NewsFilterEngine
@@ -57,11 +58,16 @@ def main() -> int:
     if not Path(args.config).exists():
         log.warning("Config %s not found - running with built-in defaults", args.config)
 
+    bot = build_bot(cfg)
+    dashboard = DashboardServer(cfg.dashboard, bot)
+    dashboard.start()
     try:
-        build_bot(cfg).run()
+        bot.run()
     except RuntimeError as exc:
         log.critical("Startup failed: %s", exc)
         return 1
+    finally:
+        dashboard.stop()
     return 0
 
 

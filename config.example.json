@@ -82,6 +82,8 @@
     "adx_min": 20.0,
     "swing_strength": 3,
     "filter_timeframe": "H4",
+    "exit_on_reversal": true,
+    "exit_timeframe": "H1",
     "bars": 400,
     "_comment": "Trend per timeframe: EMA50/200 alignment + ADX>=adx_min + swing structure. Weights are points per timeframe. filter_timeframe blocks counter-trend trades (\"\" disables)."
   },
@@ -107,7 +109,21 @@
     "max_new_per_refresh": 60,
     "request_timeout_s": 30.0,
     "cache_file": "data/sentiment_cache.json",
+    "shock_enabled": true,
+    "shock_threshold": 0.8,
+    "shock_min_relevance": 0.5,
+    "shock_pause_minutes": 60,
+    "shock_protect_positions": true,
     "_comment": "AI headline sentiment. Put your free Groq key in the GROQ_API_KEY environment variable (never in this file). Any OpenAI-compatible API works: change api_base_url, api_key_env and model."
+  },
+  "dashboard": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 8765,
+    "token_env": "DASHBOARD_TOKEN",
+    "allow_controls": true,
+    "allow_close_all": true,
+    "_comment": "Phone dashboard. Set a long random secret in the DASHBOARD_TOKEN env var (dashboard won't start without one). Keep host 127.0.0.1 and publish it privately with: tailscale serve --bg 8765"
   },
   "risk": {
     "risk_per_trade": 0.01,
