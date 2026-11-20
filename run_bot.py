@@ -16,6 +16,7 @@ from goldbot.news_filter import NewsFilterEngine
 from goldbot.notifier import TelegramNotifier
 from goldbot.orchestrator import BotOrchestrator
 from goldbot.risk_manager import RiskManager
+from goldbot.secrets_file import DEFAULT_PATH, load_secrets_file
 from goldbot.sentiment_engine import SentimentEngine
 from goldbot.state import StateStore
 
@@ -52,11 +53,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="GoldBot XAUUSD inter-market trader")
     parser.add_argument("--config", default="config.json",
                         help="path to JSON config (default: config.json)")
+    parser.add_argument("--secrets", default=DEFAULT_PATH,
+                        help="private key file (default: secrets.env)")
     args = parser.parse_args()
 
+    # Windows consoles default to a legacy code page that cannot print emoji.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    loaded = load_secrets_file(args.secrets)
     cfg = load_config(args.config if Path(args.config).exists() else None)
     setup_logging(cfg)
     log = logging.getLogger("goldbot")
+    if loaded:
+        log.info("Loaded %d secret(s) from %s", len(loaded), args.secrets)
     if not Path(args.config).exists():
         log.warning("Config %s not found - running with built-in defaults", args.config)
 

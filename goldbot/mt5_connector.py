@@ -208,6 +208,14 @@ class MT5Connector:
         self._spec_cache.clear()
         return self.connect()
 
+    def algo_trading_allowed(self) -> Optional[bool]:
+        """State of the terminal's 'Algo Trading' button (None if unknown)."""
+        try:
+            info = mt5.terminal_info()
+            return None if info is None else bool(info.trade_allowed)
+        except Exception:  # noqa: BLE001
+            return None
+
     def shutdown(self) -> None:
         try:
             mt5.shutdown()

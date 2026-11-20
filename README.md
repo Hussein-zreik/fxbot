@@ -92,13 +92,16 @@ goldbot/
   sentiment_engine.py      SentimentEngine – RSS headlines scored by an AI model (Groq), shock detector
   dashboard.py / .html     Phone dashboard – Live + Performance tabs, token-protected (stdlib only)
   notifier.py              TelegramNotifier – push alerts + daily/weekly summaries
+  secrets_file.py          secrets.env loader (keys never live in config.json)
+  setup_wizard.py          Interactive first-time setup (config, keys, Telegram chat id, dashboard token)
+  doctor.py                Health check with plain-English fixes
   performance.py           Rebuilds closed trades from MT5 history; win rate, P/L, drawdown, signal attribution
   signal_model.py          score combination and entry decision
   risk_manager.py          RiskManager – sizing, SL/TP, daily guardrail
   orchestrator.py          BotOrchestrator – 10-second main loop, news management, journal
   indicators.py            pure indicator functions
   state.py                 crash-safe persistent state (data/state.json)
-tests/                     104 tests using a fake MT5 connector (run anywhere)
+tests/                     131 tests using a fake MT5 connector (run anywhere)
 ```
 
 ---
@@ -120,6 +123,50 @@ pip install -r requirements.txt
 ---
 
 ## 4. Windows VPS and MT5 setup checklist
+
+### Quick path: one-paste installer (recommended)
+You see Windows **once**. The installer does the rest, and afterwards you run
+everything from your phone (dashboard, Telegram, MT5 app).
+
+1. **Rent a Windows VPS** (step A below) and connect from your iPhone with the *Windows App* (Remote Desktop).
+2. **Open PowerShell as Administrator:** Start menu, type `PowerShell`, right-click it, *Run as administrator*.
+3. **Paste this one command** (public repository):
+   ```powershell
+   Set-ExecutionPolicy -Scope Process Bypass -Force; irm https://raw.githubusercontent.com/hussein-zreik/fxbot/claude/mt5-gold-trading-system-dhlftm/install.ps1 -OutFile $env:TEMP\goldbot-install.ps1; & $env:TEMP\goldbot-install.ps1
+   ```
+   *Private repository?* The command above returns "404". Either make the repository public (it holds no secrets), or use a read-only GitHub token (Settings > Developer settings > Fine-grained tokens > only this repository > Contents: Read-only):
+   ```powershell
+   $t = "PASTE-TOKEN"; Set-ExecutionPolicy -Scope Process Bypass -Force; irm -Headers @{Authorization="Bearer $t"; Accept="application/vnd.github.raw"} "https://api.github.com/repos/hussein-zreik/fxbot/contents/install.ps1?ref=claude/mt5-gold-trading-system-dhlftm" -OutFile $env:TEMP\goldbot-install.ps1; & $env:TEMP\goldbot-install.ps1
+   ```
+4. **Answer the questions.** The installer:
+   - downloads the bot to `C:\goldbot` and installs Python 3.11 (its signature is checked first) and the libraries
+   - helps you install **your broker's MetaTrader 5**, then asks you to log in to your demo account and turn on *Algo Trading* (it can't do this for you)
+   - runs the **setup wizard**: pastes for your Groq key and Telegram bot token, finds your Telegram chat automatically, sends a test message, and creates the dashboard token (it can send the token to your Telegram so you can copy it on your phone)
+   - stops Windows from sleeping, and makes the bot start at every logon and restart itself if it crashes
+   - optionally sets up **auto-logon**, so the bot also comes back after Windows restarts (this stores the Windows password on the server, so it is off by default)
+   - runs the **doctor** (below), then starts the bot in **DRY-RUN** mode
+5. **Install Tailscale** on the VPS and your iPhone (see section F). If Tailscale is already on the VPS, the installer publishes the dashboard for you.
+6. **Later, to trade on the demo account:** set `execution.dry_run` to `false` in `C:\goldbot\config.json` and restart the bot (`Stop-ScheduledTask GoldBot; Start-ScheduledTask GoldBot`).
+7. **Updating:** run the same command again. Your `config.json`, `secrets.env`, data and logs are kept. After the code is merged to `main`, replace the branch name in the command with `main`, or set `$env:GOLDBOT_BRANCH="main"` first.
+
+**Where your keys live:** in `C:\goldbot\secrets.env`, a private file only your Windows account can read. It is never uploaded anywhere. Real environment variables, if you set any, take priority over it.
+
+**The doctor** checks everything and tells you what to fix. Run it any time:
+```powershell
+cd C:\goldbot
+.venv\Scripts\python -m goldbot.doctor
+```
+```
+[ OK ] MT5 account: DEMO #12345678 on Broker-Demo, 10,000.00 USD, hedging
+[WARN] Bars H4: 120/400 bars
+         -> Open a gold chart on that timeframe in MT5 and scroll back once so the history downloads.
+[FAIL] Symbol gold: 'XAUUSD' not found
+         -> Find your broker's name in MT5 Market Watch and set it under symbols in config.json.
+NOT READY: 1 problem(s) must be fixed first.
+```
+It checks Python and libraries, your keys, the news calendar, Yahoo yields, your Groq key, Telegram, MT5 (connection, demo/live, Algo Trading button, symbols, price history, spread) and the dashboard port. `[WARN]` means the bot still runs with a feature reduced. `[FAIL]` means it must be fixed first.
+
+The detailed manual steps below remain as a fallback, or if you want to understand each part.
 
 ### A. VPS
 1. **Rent a Windows VPS** (Windows Server 2019/2022, ≥ 2 vCPU, 4 GB RAM).
@@ -168,6 +215,8 @@ pip install -r requirements.txt
       setx MT5_PASSWORD "your-password"
       setx MT5_SERVER "Broker-Demo"
       ```
+> **Used the installer?** Its setup wizard already did the key and token steps below (12, 24, 30-32), so skip them. They are for manual setups.
+
 12. **Turn on AI news (free Groq key):**
     - Sign up at **console.groq.com** (no credit card), open *API Keys* → *Create API Key*, and copy it.
     - On the VPS, store it as an environment variable. Never put it in `config.json`, which could be shared by accident:
@@ -337,6 +386,6 @@ No firewall ports are opened.
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q        # 104 tests, no MT5 needed
+python -m pytest -q        # 131 tests, no MT5 needed
 python -m flake8 --max-line-length 100 goldbot run_bot.py tests
 ```

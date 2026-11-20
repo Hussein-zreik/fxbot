@@ -3,9 +3,10 @@
 Setup (once):
   1. In Telegram, message @BotFather -> /newbot -> copy the bot token.
   2. Send any message (e.g. "hi") to your new bot.
-  3. On the VPS:  setx TELEGRAM_BOT_TOKEN "123456:ABC..."
+  3. On the VPS:  python -m goldbot.setup_wizard   (does steps 3-4 for you)
+     or put TELEGRAM_BOT_TOKEN=... in secrets.env and run
                   python -m goldbot.notifier --setup
-     This finds your chat id, prints the setx command for it and sends a test.
+     This finds your chat id, saves it to secrets.env and sends a test.
 
 Messages go out on a background thread with a queue, so a slow or failing
 Telegram call never delays trading. Messages are sent as plain text (no
@@ -112,16 +113,22 @@ class TelegramNotifier:
 # --------------------------------------------------------------------------- #
 # One-time setup helper:  python -m goldbot.notifier --setup
 # --------------------------------------------------------------------------- #
-def _setup() -> int:
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    if not token:
-        print("First set your bot token:  setx TELEGRAM_BOT_TOKEN \"<token from @BotFather>\"")
-        print("then open a NEW terminal and run this again.")
-        return 1
-    resp = requests.get(_API.format(token=token, method="getUpdates"), timeout=15)
+class TelegramSetupError(Exception):
+    """A problem the user can fix; the message says how."""
+
+
+def find_chat_id(token: str, http_get: Callable = requests.get):
+    """Return (chat_id, name) of the most recent chat that messaged the bot."""
+    try:
+        resp = http_get(_API.format(token=token, method="getUpdates"), timeout=15)
+    except requests.RequestException as exc:
+        raise TelegramSetupError(f"Could not reach Telegram ({type(exc).__name__}). "
+                                 "Check the server's internet connection.") from None
+    if resp.status_code in (401, 404):
+        raise TelegramSetupError("Telegram rejected the token. Copy it again from "
+                                 "@BotFather (no spaces or quotes).")
     if resp.status_code != 200:
-        print(f"Telegram rejected the token (HTTP {resp.status_code}). Check it with @BotFather.")
-        return 1
+        raise TelegramSetupError(f"Telegram returned an error (HTTP {resp.status_code}).")
     chats = {}
     for upd in resp.json().get("result", []):
         msg = upd.get("message") or upd.get("channel_post") or {}
@@ -129,13 +136,30 @@ def _setup() -> int:
         if "id" in chat:
             chats[chat["id"]] = chat.get("first_name") or chat.get("title") or "?"
     if not chats:
-        print("No messages found. Open Telegram, send 'hi' to your bot, then run this again.")
-        return 1
+        raise TelegramSetupError("No messages found. Open Telegram, open your bot, "
+                                 "press Start, send 'hi', then try again.")
     chat_id, name = list(chats.items())[-1]
-    print(f"Found chat with {name}: {chat_id}")
-    print(f'Run:  setx TELEGRAM_CHAT_ID "{chat_id}"')
+    return chat_id, name
+
+
+def _setup() -> int:
+    from .secrets_file import DEFAULT_PATH, load_secrets_file, update_secrets_file
+    load_secrets_file(DEFAULT_PATH)
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        print("No bot token found. Run the installer wizard (python -m goldbot.setup_wizard)")
+        print("or add a line  TELEGRAM_BOT_TOKEN=<token from @BotFather>  to secrets.env.")
+        return 1
+    try:
+        chat_id, name = find_chat_id(token)
+    except TelegramSetupError as exc:
+        print(exc)
+        return 1
+    print(f"Found chat with {name}.")
+    update_secrets_file(DEFAULT_PATH, {"TELEGRAM_CHAT_ID": str(chat_id)})
+    print(f"Saved to {DEFAULT_PATH}.")
     ok = TelegramNotifier(AlertsConfig(), token=token, chat_id=str(chat_id)).deliver(
-        "GoldBot: Telegram alerts are working ✅")
+        "GoldBot: Telegram alerts are working \u2705")
     print("Test message sent." if ok else "Test message failed - see log.")
     return 0 if ok else 1
 

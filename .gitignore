@@ -6,3 +6,4 @@ venv/
 config.json
 logs/
 data/
+secrets.env
