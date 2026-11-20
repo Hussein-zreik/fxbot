@@ -1,73 +1,37 @@
-from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+"""RiskManager only places the stop and target now; sizing/approval live in risk.*."""
 
 from goldbot.config import RiskConfig
-from goldbot.mt5_connector import BUY, SELL, Tick
-from goldbot.risk_manager import RiskManager, round_volume_down
-from goldbot.state import StateStore
-from tests.conftest import GOLD_SPEC, FakeConnector
+from goldbot.mt5_connector import Tick
+from goldbot.risk_manager import RiskManager, round_price, round_volume_down
+from tests.conftest import GOLD_SPEC
 
-NOW = datetime(2026, 9, 23, 10, 0, tzinfo=timezone.utc)
 TICK = Tick(bid=2600.00, ask=2600.30, time_msc=1)
 
 
-def manager(tmp_path, account, now=NOW, **risk):
-    conn = FakeConnector({}, TICK, account)
-    clock = {"now": now}
-    rm = RiskManager(RiskConfig(**risk), conn, StateStore(str(tmp_path / "s.json")),
-                     clock=lambda: clock["now"])
-    return rm, clock
-
-
-def test_lot_size_risks_one_percent(tmp_path, account):
-    rm, _ = manager(tmp_path, account)
-    plan, why = rm.plan_trade(BUY, TICK, atr_value=4.0, acc=account, spec=GOLD_SPEC)
+def test_buy_levels_use_the_ask_and_atr_multiples():
+    levels, why = RiskManager(RiskConfig()).plan_levels("BUY", TICK, 4.0, GOLD_SPEC)
     assert why == "ok"
-    # SL = 1.5 * 4 = 6.00 below ask; 1 lot loses 600 USD; 1 % of 10k = 100 -> 0.16 lots
-    assert plan.sl == 2594.30 and plan.tp == 2612.30
-    assert plan.volume == 0.16
-    assert plan.risk_amount <= 100.0
+    assert (levels.entry, levels.sl, levels.tp) == (2600.30, 2594.30, 2612.30)
+    assert levels.sl_distance == 6.0                       # spread is inside the risk distance
 
 
-def test_sell_levels_mirror(tmp_path, account):
-    rm, _ = manager(tmp_path, account)
-    plan, _ = rm.plan_trade(SELL, TICK, 4.0, account, GOLD_SPEC)
-    assert plan.entry == 2600.00 and plan.sl == 2606.00 and plan.tp == 2588.00
+def test_sell_levels_mirror_with_the_bid():
+    levels, _ = RiskManager(RiskConfig()).plan_levels("SELL", TICK, 4.0, GOLD_SPEC)
+    assert (levels.entry, levels.sl, levels.tp) == (2600.00, 2606.00, 2588.00)
 
 
-def test_never_rounds_risk_up(tmp_path, account):
-    small = replace(account, equity=500.0, balance=500.0)
-    rm, _ = manager(tmp_path, small)
-    plan, why = rm.plan_trade(BUY, TICK, 4.0, small, GOLD_SPEC)
-    assert plan is None and "below broker minimum" in why
+def test_bad_atr_is_refused():
+    for atr in (0, -1, float("nan"), None):
+        levels, why = RiskManager(RiskConfig()).plan_levels("BUY", TICK, atr, GOLD_SPEC)
+        assert levels is None and why == "invalid ATR"
 
 
-def test_spread_filter(tmp_path, account):
-    rm, _ = manager(tmp_path, account, max_spread_points=20)
-    plan, why = rm.plan_trade(BUY, TICK, 4.0, account, GOLD_SPEC)
-    assert plan is None and "spread" in why
-
-
-def test_round_volume_down():
+def test_rounding_helpers():
     assert round_volume_down(0.1699, GOLD_SPEC) == 0.16
-    assert round_volume_down(0.17, GOLD_SPEC) == 0.17
+    assert round_volume_down(0.4999999998, GOLD_SPEC) == 0.5
+    assert round_price(2594.304, GOLD_SPEC) == 2594.30
 
 
-def test_daily_guardrail_triggers_persists_and_resets(tmp_path, account):
-    rm, clock = manager(tmp_path, account)
-    assert not rm.update_daily(account).halted
-
-    down = replace(account, equity=9_690.0)  # -3.1 %
-    status = rm.update_daily(down)
-    assert status.halted and status.just_triggered
-
-    # A restart the same day must stay halted, even if equity recovers.
-    rm2 = RiskManager(RiskConfig(), rm.connector, StateStore(str(tmp_path / "s.json")),
-                      clock=lambda: clock["now"])
-    assert rm2.update_daily(account).halted
-
-    # Next UTC day: new starting balance, trading resumes.
-    clock["now"] = NOW + timedelta(days=1)
-    rm2._clock = lambda: clock["now"]
-    status = rm2.update_daily(replace(account, balance=9_690.0, equity=9_690.0))
-    assert not status.halted and status.day_start_balance == 9_690.0
+def test_reward_to_risk_of_the_default_levels_meets_the_rulebook_minimum():
+    levels, _ = RiskManager(RiskConfig()).plan_levels("BUY", TICK, 4.0, GOLD_SPEC)
+    assert (levels.tp - levels.entry) / levels.sl_distance >= 1.5

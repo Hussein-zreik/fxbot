@@ -46,10 +46,15 @@ class FakeConnector:
         self.acc = account
         self.dry_run = dry_run
         self.utc_offset_known = True
+        self.utc_offset_seconds = 3 * 3600
+        self.drift_ms = 40.0
+        self.spread_median = 20.0
         self.live = True
         self.open_positions: List[PositionInfo] = []
         self.sent: List[tuple] = []
 
+    def clock_drift_ms(self): return self.drift_ms
+    def hourly_spread_median(self, symbol, hour_utc, days=7): return self.spread_median
     def connect(self): return True
     def ensure_connected(self): return True
     def shutdown(self): pass

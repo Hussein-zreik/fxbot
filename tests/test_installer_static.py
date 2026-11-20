@@ -49,6 +49,13 @@ def test_robocopy_does_not_exclude_needed_folders():
     assert (REPO / "goldbot" / "dashboard.html").exists()     # shipped static asset
 
 
+def test_the_rulebook_ships_with_the_installer():
+    excluded = re.search(r"/XD ([^/]+?) /XF", SCRIPT).group(1).split()
+    assert "risk" not in excluded and (REPO / "risk" / "limits.yaml").exists()
+    assert "pydantic" in (REPO / "requirements.txt").read_text()
+    assert "PyYAML" in (REPO / "requirements.txt").read_text()
+
+
 def test_keeps_user_files_on_update():
     assert "/XF config.json secrets.env" in SCRIPT
     assert "/XD" in SCRIPT and "data" in SCRIPT and "logs" in SCRIPT

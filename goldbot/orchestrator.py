@@ -22,18 +22,27 @@ import logging
 import math
 import queue
 import threading
+import uuid
 from collections import deque
+from decimal import Decimal
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .config import AppConfig
 from .correlation_engine import CorrelationEngine, CorrelationSnapshot
+from .indicators import atr as atr_series
 from .macro_engine import MacroDataEngine, YieldSnapshot
 from .mt5_connector import BUY, PositionInfo
 from .news_filter import NewsFilterEngine, NewsState
 from .notifier import TelegramNotifier
 from .performance import build_trades, compute_stats, json_safe, summary_text
+from .risk.engine import MonitorStatus
+from .risk.livegate import GateResult
+from .risk.retcodes import Action, action_for
+from .risk.sizing import actual_risk_usd, overshoot_ok
+from .risk.suite import RiskSuite
+from .risk.types import InvalidIntent, OrderIntent, PortfolioState, PositionRisk, SymbolInfo
 from .risk_manager import RiskManager, round_volume_down
 from .sentiment_engine import SentimentEngine, SentimentSnapshot
 from .signal_model import Signal, build_signal
@@ -53,6 +62,9 @@ JOURNAL_FIELDS = [
 ]
 
 COMMANDS = ("pause", "resume", "close_all")
+STRATEGY_ID = "gold_macro"
+CANONICAL_GOLD = "XAUUSD"      # the rulebook's name for this sleeve's instrument
+PENDING_CLOSE_GIVE_UP = timedelta(minutes=30)
 
 
 def _parse_hhmm(value: str) -> dtime:
@@ -74,10 +86,24 @@ def _num(x: Any) -> Any:
 class BotOrchestrator:
     def __init__(self, cfg: AppConfig, connector, macro: MacroDataEngine,
                  news: NewsFilterEngine, risk: RiskManager, state: StateStore,
+                 suite: RiskSuite,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  sentiment: Optional[SentimentEngine] = None,
-                 notifier: Optional[TelegramNotifier] = None):
+                 notifier: Optional[TelegramNotifier] = None,
+                 mode: str = "paper",
+                 live_gate: Optional[Callable[[int], GateResult]] = None,
+                 independent_feed: Optional[Callable[[str], Optional[float]]] = None):
         self.cfg = cfg
+        self.suite = suite
+        self.mode = mode
+        self._live_gate = live_gate
+        self.live_gate_ok = False
+        self.independent_feed = independent_feed
+        self._periods = None
+        self._ladder_level = 0
+        self._blocked_reasons: set = set()
+        self._pending_close: Dict[int, datetime] = {}
+        self._spread_cache: Optional[tuple] = None
         self.connector = connector
         self.macro = macro
         self.news = news
@@ -129,8 +155,25 @@ class BotOrchestrator:
         self.technical = TechnicalEngine(self.connector, self.cfg.strategy, self.gold)
         self.trend = TrendEngine(self.connector, self.cfg.trend, self.gold)
         self.news.refresh(force=False)
-        log.info("Trading %s | silver %s | USD proxy %s | dry_run=%s",
-                 self.gold, silver, dxy or f"1/{eurusd}", self.connector.dry_run)
+        self._evaluate_live_gate()
+        log.info("Trading %s | silver %s | USD proxy %s | mode=%s | dry_run=%s | stage=%s",
+                 self.gold, silver, dxy or f"1/{eurusd}", self.mode, self.connector.dry_run,
+                 self.suite.limits.stage)
+
+    def _evaluate_live_gate(self) -> None:
+        """Prime directive 6: live only when all four conditions hold."""
+        if self.mode != "live":
+            return
+        acc = self.connector.account()
+        result = (self._live_gate(acc.login) if (self._live_gate and acc)
+                  else GateResult(False, ["no account or gate available"]))
+        self.live_gate_ok = result.ok
+        if not result.ok:
+            self.connector.dry_run = True                      # fail safe: send nothing
+            log.critical("MODE=live but the live gate is NOT satisfied: %s. Nothing will be "
+                         "sent.", "; ".join(result.missing))
+            self._event("MODE=live requested but the live gate failed: "
+                        + "; ".join(result.missing), "system")
 
     def run(self) -> None:
         self.setup()
@@ -224,8 +267,10 @@ class BotOrchestrator:
             self._publish(ctx)
 
     def _step(self, ctx: Dict[str, Any]) -> None:
+        suite = self.suite
         if not self.connector.ensure_connected():
             log.error("MT5 unavailable; will retry next loop")
+            suite.kill.record_equity_unavailable(self._clock())
             if self._was_connected:
                 self._event("⚠ Lost connection to MT5 - retrying", "system")
                 self._was_connected = False
@@ -238,19 +283,52 @@ class BotOrchestrator:
 
         acc = self.connector.account()
         if acc is None:
+            suite.kill.record_equity_unavailable(self._clock())
             return
         ctx["account"] = acc
         self._currency = acc.currency
+        now = self._clock()
 
         magic = self.cfg.execution.magic
         positions = self.connector.positions(self.gold, magic)
         ctx["positions"] = positions
         self._track_exits(positions)
 
-        guard = self.risk.update_daily(acc)
-        ctx["guard"] = guard
-        if guard.just_triggered:
-            self._event(f"🛑 DAILY LOSS LIMIT: {guard.reason}. Closing all bot trades.", "risk")
+        # --- continuous risk: baselines, ladder, kill switch (every loop)
+        if self.connector.utc_offset_known:
+            self._periods = suite.periods.update(acc.equity, now,
+                                                 self.connector.utc_offset_seconds)
+        ladder = suite.ladder.update(acc.equity, now)
+        self._ladder_level = ladder.level
+        if ladder.changed:
+            self._event(f"Drawdown ladder is now L{ladder.level} "
+                        f"(-{ladder.dd_pct:.1f}% from the equity high of {ladder.hwm:,.2f})",
+                        "risk")
+        suite.kill.record_equity(now, acc.equity)
+        reason = suite.kill.check(now, ladder.level, bool(positions))
+        if reason and not suite.kill.is_killed():
+            suite.kill.trip(reason, now)
+            self._event(f"🛑 KILL SWITCH ({reason}): flattening all bot trades and halting. "
+                        "Reset needs a written note: python -m goldbot.riskctl reset-kill",
+                        "risk")
+        if suite.kill.is_killed():
+            ctx["killed"] = True
+            self._flatten("kill switch: " + ", ".join(suite.kill.reasons()))
+            return
+
+        day = self._day_key(now)
+        streak = suite.ledger.streak()
+        mon = suite.engine.monitor(
+            equity=acc.equity,
+            day_start_equity=self._periods.day_start_equity if self._periods else acc.equity,
+            week_start_equity=self._periods.week_start_equity if self._periods else acc.equity,
+            losing_trades_today=suite.ledger.losing_today(day),
+            consecutive_losses=streak.consecutive_losses,
+            day_stopped=suite.ledger.day_stopped(day), ladder_level=ladder.level,
+            halted=bool(suite.store.active_halts()))
+        ctx["monitor"] = mon
+        self._alert_block_changes(mon)
+
         self.news.refresh()
         news_state = self.news.state()
         ai = self.sentiment.snapshot() if self.sentiment else SentimentSnapshot()
@@ -263,10 +341,6 @@ class BotOrchestrator:
 
         self._refresh_performance()
         self._maybe_send_summaries(acc)
-
-        if guard.halted:
-            self._flatten(guard.reason)
-            return
 
         if positions:
             if self.cfg.news.manage_open_positions and news_state.imminent:
@@ -304,7 +378,21 @@ class BotOrchestrator:
         sig = build_signal(ys, cs, tech, self.cfg.strategy, trend, ai)
         action = self._decide_and_execute(sig, tech, news_state, ai, positions, acc)
         self._report(sig, ys, cs, tech, trend, ai, news_state, positions, action,
-                     guard.daily_loss_pct)
+                     mon.daily_loss_pct / 100)
+
+    def _day_key(self, now: datetime) -> str:
+        return self._periods.day_key if self._periods else now.date().isoformat()
+
+    def _alert_block_changes(self, mon: MonitorStatus) -> None:
+        current = set(mon.reasons)
+        newly = current - self._blocked_reasons
+        if newly:
+            self._event(f"⛔ New entries blocked: {', '.join(sorted(newly))} "
+                        f"(day {-mon.daily_loss_pct:+.2f}%, week {-mon.weekly_loss_pct:+.2f}%)",
+                        "risk")
+        elif self._blocked_reasons and not current:
+            self._event("New entries allowed again", "risk")
+        self._blocked_reasons = current
 
     # ----------------------------------------------------------------- #
     # Entry gates and execution
@@ -340,6 +428,86 @@ class BotOrchestrator:
         t = now.time()
         return start <= t < end if start < end else (t >= start or t < end)
 
+    # -- risk-engine inputs ------------------------------------------------ #
+    def _symbol_info(self, spec) -> SymbolInfo:
+        return SymbolInfo(
+            name=spec.name, canonical=CANONICAL_GOLD, point=spec.point, digits=spec.digits,
+            tick_size=spec.tick_size, tick_value=spec.tick_value,
+            contract_size=spec.contract_size, volume_min=spec.volume_min,
+            volume_max=min(spec.volume_max, self.cfg.risk.max_lot),
+            volume_step=spec.volume_step, stops_level=spec.stops_level,
+            freeze_level=spec.freeze_level)
+
+    def _position_risks(self, positions: List[PositionInfo], spec) -> List[PositionRisk]:
+        out = []
+        for p in positions:
+            risk = self.suite.ledger.risk_for(p.ticket)
+            if risk is None and p.sl:
+                risk = float(actual_risk_usd(fill=p.price_open, sl=p.sl,
+                                             tick_size=spec.tick_size,
+                                             tick_value=spec.tick_value, lots=p.volume))
+            out.append(PositionRisk(p.ticket, CANONICAL_GOLD, risk,
+                                    p.volume * spec.contract_size * p.price_open))
+        return out
+
+    def _spread_baseline(self, now: datetime) -> Optional[float]:
+        cached = self._spread_cache
+        if cached and cached[0] == now.hour and now - cached[1] < cached[3]:
+            return cached[2]
+        value = self.connector.hourly_spread_median(self.gold, now.hour)
+        ttl = timedelta(minutes=30) if value is not None else timedelta(minutes=5)
+        self._spread_cache = (now.hour, now, value, ttl)
+        return value
+
+    def _atr_1m(self) -> Optional[float]:
+        df = self.connector.get_rates(self.gold, "M1", 120)
+        if df is None or len(df) < 20:
+            return None
+        value = float(atr_series(df, 14).iat[-1])
+        return value if value == value else None
+
+    def _build_state(self, *, acc, positions, news_state, tick, spec, now, side) -> PortfolioState:
+        suite, day = self.suite, self._day_key(now)
+        streak = suite.ledger.streak()
+        halts = suite.store.active_halts()
+        periods = self._periods
+        known = self.connector.utc_offset_known
+        return PortfolioState(
+            now_utc=now,
+            server_utc_offset_s=self.connector.utc_offset_seconds if known else None,
+            equity=acc.equity,
+            day_start_equity=periods.day_start_equity if periods else acc.equity,
+            week_start_equity=periods.week_start_equity if periods else acc.equity,
+            open_positions=self._position_risks(positions, spec),
+            trades_today=suite.ledger.trades_today(day),
+            losing_trades_today=suite.ledger.losing_today(day),
+            consecutive_losses=streak.consecutive_losses,
+            risk_halved_by_streak=streak.halved,
+            day_stopped=suite.ledger.day_stopped(day),
+            ladder_level=self._ladder_level,
+            risk_cap_pct=suite.ladder.risk_cap_pct(),
+            broker_connected=True,
+            clock_drift_ms=self.connector.clock_drift_ms(),
+            kill_flag=suite.kill.flag_path.exists(),
+            halted=bool(halts),
+            halt_reason="; ".join(f"{h['kind']}: {h['reason']}" for h in halts),
+            mode=self.mode, orders_enabled=not self.connector.dry_run,
+            account_login=acc.login, expected_login=self.cfg.mt5.login or None,
+            account_is_demo=acc.is_demo, live_gate_ok=self.live_gate_ok,
+            news_blackout=news_state.blackout, news_reason=news_state.reason,
+            calendar_fresh=self.news.calendar_is_valid(),
+            spread_points=(tick.ask - tick.bid) / spec.point,
+            spread_hour_median_points=self._spread_baseline(now),
+            margin_used=max(0.0, acc.equity - acc.margin_free),
+            margin_per_lot=self.connector.calc_margin(
+                self.gold, side, 1.0, tick.ask if side == "BUY" else tick.bid),
+            independent_mid=(self.independent_feed(CANONICAL_GOLD)
+                             if self.independent_feed else None),
+            atr_1m=self._atr_1m(),
+            recent_order_sizes=suite.ledger.recent_sizes(),
+            symbol=self._symbol_info(spec))
+
+    # -- decision and execution -------------------------------------------- #
     def _decide_and_execute(self, sig: Signal, tech: TechnicalSnapshot,
                             news_state: NewsState, ai: SentimentSnapshot,
                             positions: List[PositionInfo], acc) -> str:
@@ -354,20 +522,41 @@ class BotOrchestrator:
         tick = self.connector.get_tick(self.gold)
         if spec is None or tick is None:
             return f"{sig.direction} skipped: no symbol spec/tick"
-
-        plan, why = self.risk.plan_trade(sig.direction, tick, tech.atr, acc, spec)
-        if plan is None:
+        levels, why = self.risk.plan_levels(sig.direction, tick, tech.atr, spec)
+        if levels is None:
             return f"{sig.direction} skipped: {why}"
+        try:
+            intent = OrderIntent(intent_id=uuid.uuid4().hex[:16], strategy=STRATEGY_ID,
+                                 symbol=CANONICAL_GOLD, side=levels.side, entry=levels.entry,
+                                 sl=levels.sl, tp=levels.tp, bid=tick.bid, ask=tick.ask)
+        except InvalidIntent as exc:
+            return f"{sig.direction} skipped: invalid order intent ({exc})"
 
-        comment = f"{self.cfg.execution.order_comment} {sig.total:+d}"
-        result = self.connector.open_market(self.gold, plan.side, plan.volume,
-                                            plan.sl, plan.tp, comment)
-        desc = (f"{plan.side} {plan.volume} @ {plan.entry} SL {plan.sl} TP {plan.tp} "
-                f"risk {plan.risk_amount:.2f} {acc.currency}")
+        now = self._clock()
+        state = self._build_state(acc=acc, positions=positions, news_state=news_state,
+                                  tick=tick, spec=spec, now=now, side=levels.side)
+        decision = self.suite.engine.approve(intent, state)      # prime directive 2
+        if not decision.approved:
+            log.info("RISK REJECT %s: %s", decision.reason_code, decision.detail)
+            return f"{sig.direction} REJECTED {decision.reason_code}: {decision.detail}"
+        lots = decision.adjusted_size
+
+        comment = f"{STRATEGY_ID} {sig.total:+d}"
+        before = {p.ticket for p in self.connector.positions(self.gold,
+                                                             self.cfg.execution.magic)}
+        if not self.connector.dry_run:
+            self.suite.kill.record_order_sent(now)
+        result = self.connector.open_market(self.gold, levels.side, lots, levels.sl,
+                                            levels.tp, comment)
+        desc = (f"{levels.side} {lots} @ {levels.entry} SL {levels.sl} TP {levels.tp} "
+                f"risk {decision.risk_usd:.2f} {acc.currency} ({decision.risk_pct:g}%)")
+        if not result.dry_run:
+            self.suite.kill.record_order_result(now, result.ok, result.retcode)
+            self._react_to_retcode(result, now)
         if result.ok:
             log.info("ORDER %s%s", "[DRY-RUN] " if result.dry_run else "", desc)
-            if not result.dry_run and result.ticket:
-                self._remember_trade(result.ticket, sig)
+            if not result.dry_run:
+                self._after_fill(sig, decision, spec, before, result, now)
             self._event(("DRY-RUN " if result.dry_run else "✅ Opened ") + desc +
                         f" (score {sig.total:+d})", "trade")
             return ("DRY-RUN " if result.dry_run else "OPENED ") + desc
@@ -375,20 +564,79 @@ class BotOrchestrator:
         self._event(f"❌ Order FAILED: {desc} ({result.retcode} {result.message})", "trade")
         return f"FAILED {desc}: {result.retcode} {result.message}"
 
+    def _react_to_retcode(self, result, now: datetime) -> None:
+        action = action_for(result.retcode)
+        if action is Action.HALT:
+            self.suite.store.add_halt("HALT", f"retcode {result.retcode}: {result.message}",
+                                      now)
+            self._event(f"🛑 TRADING HALTED by broker code {result.retcode} "
+                        f"({result.message}). Clear it with: python -m goldbot.riskctl "
+                        "clear-halt", "risk")
+        elif action is Action.UNKNOWN:
+            log.error("Unknown MT5 retcode %s (%s)", result.retcode, result.message)
+
+    def _after_fill(self, sig: Signal, decision, spec, before: set, result,
+                    now: datetime) -> None:
+        """Book the trade, then verify the stop is attached and the risk is as planned."""
+        fresh = [p for p in self.connector.positions(self.gold, self.cfg.execution.magic)
+                 if p.ticket not in before]
+        pos = fresh[0] if fresh else None
+        ticket = pos.ticket if pos else result.ticket
+        if self._prev_tickets is not None:       # so a very fast close is still noticed
+            self._prev_tickets.add(ticket)
+        self.suite.ledger.record_open(self._day_key(now), ticket, decision.risk_usd,
+                                      decision.adjusted_size)
+        self._remember_trade(ticket, sig)
+        if pos is None:
+            self._event("⚠ Order accepted but the new position was not found to verify its "
+                        "stop-loss. Check MT5 now.", "risk")
+            return
+        problem = ""
+        if not pos.sl:
+            problem = "NO STOP-LOSS attached"
+        else:
+            actual = actual_risk_usd(fill=pos.price_open, sl=pos.sl, tick_size=spec.tick_size,
+                                     tick_value=spec.tick_value, lots=pos.volume)
+            if not overshoot_ok(actual=actual, planned=Decimal(str(decision.risk_usd))):
+                problem = (f"actual risk ${float(actual):.2f} is more than 10% above the "
+                           f"planned ${decision.risk_usd:.2f}")
+        if problem:
+            res = self.connector.close_position(pos)
+            self._event(f"🛑 Closed #{pos.ticket} immediately: {problem} "
+                        f"({'ok' if res.ok else res.message})", "risk")
+
     # ----------------------------------------------------------------- #
     # Position management
     # ----------------------------------------------------------------- #
     def _track_exits(self, positions: List[PositionInfo]) -> None:
+        now = self._clock()
         tickets = {p.ticket for p in positions}
         if self._prev_tickets is not None and self._prev_tickets - tickets:
             closed = self._prev_tickets - tickets
             log.info("Position(s) closed: %s - cooldown %d min", sorted(closed),
                      self.cfg.execution.cooldown_minutes)
-            for ticket in sorted(closed):
-                self._event(self._close_message(ticket), "trade")
-            self.state.set("last_exit_time", self._clock().isoformat())
+            for ticket in closed:
+                self._pending_close[ticket] = now
+            self.state.set("last_exit_time", now.isoformat())
             self._perf_at = None  # refresh stats now
         self._prev_tickets = tickets
+        self._book_closed(now)
+
+    def _book_closed(self, now: datetime) -> None:
+        """Book each closed position in the ledger once MT5 history has its deals."""
+        for ticket, since in list(self._pending_close.items()):
+            trades = build_trades(self.connector.position_deals(ticket),
+                                  self.cfg.execution.magic)
+            if not trades:
+                if now - since > PENDING_CLOSE_GIVE_UP:
+                    del self._pending_close[ticket]
+                    self._event(f"⚠ Could not find the deals of closed position #{ticket}; "
+                                "its result was not booked", "risk")
+                continue
+            del self._pending_close[ticket]
+            t = trades[0]
+            r = self.suite.ledger.record_close(self._day_key(now), ticket, t.profit)
+            self._event(self._close_text(ticket, t, r), "trade")
 
     def _remember_trade(self, ticket: int, sig: Signal) -> None:
         """Store the entry score breakdown so performance can attribute it."""
@@ -400,18 +648,14 @@ class BotOrchestrator:
             meta = dict(list(meta.items())[-1000:])
         self.state.set("trade_meta", meta)
 
-    def _close_message(self, ticket: int) -> str:
-        deals = self.connector.position_deals(ticket)
-        trades = build_trades(deals, self.cfg.execution.magic)
-        if not trades:
-            return f"Position #{ticket} closed"
-        t = trades[0]
+    def _close_text(self, ticket: int, t, r: Optional[float]) -> str:
         icon = "🟢" if t.profit > 0 else "🔴"
         why = {"TP": "take profit", "SL": "stop loss", "BOT": "closed by bot",
                "MANUAL": "closed manually", "STOP_OUT": "STOP OUT"}.get(t.exit_reason,
                                                                         t.exit_reason)
+        rtxt = f", {r:+.2f}R" if r is not None else ""
         return (f"{icon} Closed {t.side} {t.volume} #{ticket}: {t.profit:+.2f} "
-                f"{self._currency} ({why}, {t.hold_minutes:.0f} min)")
+                f"{self._currency} ({why}{rtxt}, {t.hold_minutes:.0f} min)")
 
     # ----------------------------------------------------------------- #
     # Performance and summaries
@@ -618,14 +862,16 @@ class BotOrchestrator:
 
     def _publish(self, ctx: Dict[str, Any]) -> None:
         """Build the JSON-safe snapshot the dashboard serves."""
-        acc, guard = ctx.get("account"), ctx.get("guard")
+        acc, mon = ctx.get("account"), ctx.get("monitor")
         ns: Optional[NewsState] = ctx.get("news")
         ai: Optional[SentimentSnapshot] = ctx.get("ai")
         dash = self.cfg.dashboard
 
         if not ctx.get("connected"):
             mode = "DISCONNECTED"
-        elif guard is not None and guard.halted:
+        elif ctx.get("killed"):
+            mode = "KILLED"
+        elif mon is not None and mon.entries_blocked:
             mode = "HALTED"
         elif self.paused:
             mode = "PAUSED"
@@ -642,8 +888,10 @@ class BotOrchestrator:
             "market_live": ctx.get("market_live"),
             "dry_run": self.connector.dry_run,
             "paused": self.paused,
-            "halted": bool(guard and guard.halted),
-            "halt_reason": guard.reason if guard else "",
+            "halted": bool(ctx.get("killed") or (mon and mon.entries_blocked)),
+            "halt_reason": (", ".join(self.suite.kill.reasons())
+                            if ctx.get("killed") else ", ".join(mon.reasons) if mon else ""),
+            "risk": self._risk_status(mon, ctx.get("killed", False)),
             "thresholds": {"buy": self.cfg.strategy.buy_threshold,
                            "sell": self.cfg.strategy.sell_threshold},
             "weights": {"yield": self.cfg.strategy.weight_yield,
@@ -669,7 +917,7 @@ class BotOrchestrator:
             status["account"] = {
                 "balance": acc.balance, "equity": acc.equity, "currency": acc.currency,
                 "demo": acc.is_demo,
-                "day_pl_pct": _num(-guard.daily_loss_pct * 100) if guard else None,
+                "day_pl_pct": _num(-mon.daily_loss_pct) if mon else None,
             }
         if ns is not None:
             nxt = ns.next_event
@@ -688,6 +936,22 @@ class BotOrchestrator:
             }
         with self._status_lock:
             self._status = status
+
+    def _risk_status(self, mon: Optional[MonitorStatus], killed: bool) -> Dict[str, Any]:
+        last = self.suite.store.decisions(1)
+        return {
+            "stage": self.suite.limits.stage, "mode": self.mode,
+            "ladder_level": self._ladder_level, "killed": killed,
+            "kill_reasons": self.suite.kill.reasons(),
+            "blocked": list(mon.reasons) if mon else [],
+            "daily_loss_pct": _num(mon.daily_loss_pct) if mon else None,
+            "weekly_loss_pct": _num(mon.weekly_loss_pct) if mon else None,
+            "per_trade_pct": self.suite.limits.per_trade_cap(),
+            "live_gate_ok": self.live_gate_ok,
+            "last_decision": ({"time": last[0]["ts"], "approved": bool(last[0]["approved"]),
+                               "reason": last[0]["reason_code"], "detail": last[0]["detail"]}
+                              if last else None),
+        }
 
     def _journal(self, row: dict) -> None:
         path = Path(self.cfg.journal_file)

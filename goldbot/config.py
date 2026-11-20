@@ -11,7 +11,7 @@ import json
 import os
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -185,14 +185,21 @@ class NewsConfig:
 
 @dataclass
 class RiskConfig:
-    risk_per_trade: float = 0.01
+    """Levels and operational paths. The LIMITS live in risk/limits.yaml (the rulebook).
+
+    ``overrides`` may only TIGHTEN the rulebook (e.g. {"max_trades_per_day": 2});
+    anything looser makes the bot refuse to start.
+    """
     sl_atr_mult: float = 1.5
     tp_atr_mult: float = 3.0
-    max_daily_loss: float = 0.03
+    max_lot: float = 5.0                     # tightens the broker's volume_max
     close_all_account_positions_on_halt: bool = False
-    max_spread_points: int = 60
-    max_lot: float = 5.0
-    margin_usage_limit: float = 0.9          # max share of free margin per trade
+    limits_file: str = ""                    # empty = risk/limits.yaml next to the program
+    overrides: Dict[str, Any] = field(default_factory=dict)
+    db_file: str = "data/risk.db"
+    kill_flag_file: str = "ops/KILL"
+    changelog_file: str = "CHANGELOG.md"
+    live_confirm_file: str = "LIVE_CONFIRM"
 
 
 @dataclass
@@ -252,12 +259,11 @@ def _merge(instance: Any, overrides: dict, path: str = "") -> None:
 
 def _validate(cfg: AppConfig) -> None:
     s, r, e = cfg.strategy, cfg.risk, cfg.execution
-    if not 0 < r.risk_per_trade <= 0.05:
-        raise ValueError("risk.risk_per_trade must be in (0, 0.05]")
-    if not 0 < r.max_daily_loss <= 0.2:
-        raise ValueError("risk.max_daily_loss must be in (0, 0.2]")
-    if r.sl_atr_mult <= 0 or r.tp_atr_mult <= 0:
-        raise ValueError("ATR multipliers must be positive")
+    if r.sl_atr_mult <= 0 or r.tp_atr_mult <= 0 or r.max_lot <= 0:
+        raise ValueError("risk ATR multipliers and max_lot must be positive")
+    if r.tp_atr_mult / r.sl_atr_mult < 1.5:
+        raise ValueError("risk.tp_atr_mult / sl_atr_mult must be at least 1.5 "
+                         "(the rulebook's minimum reward:risk)")
     if s.buy_threshold <= 0 or s.sell_threshold >= 0:
         raise ValueError("buy_threshold must be > 0 and sell_threshold < 0")
     if e.max_open_positions < 1:

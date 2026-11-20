@@ -7,9 +7,13 @@ import numpy as np
 
 from goldbot.config import AppConfig
 from goldbot.macro_engine import MacroDataEngine
-from goldbot.mt5_connector import Tick
+from goldbot.mt5_connector import OrderResult, Tick
 from goldbot.news_filter import NewsFilterEngine
 from goldbot.orchestrator import BotOrchestrator
+from goldbot.mt5_connector import PositionInfo
+from goldbot.risk.livegate import GateResult
+from goldbot.risk.suite import build_suite
+from goldbot.risk.types import RiskDecision
 from goldbot.risk_manager import RiskManager
 from goldbot.state import StateStore
 from tests.conftest import FakeConnector, long_position, make_bars
@@ -41,6 +45,8 @@ def bullish_market():
         ("XAGUSD", "M15"): make_bars(silver15, start15, 15, spread=0.005),
         ("EURUSD", "M15"): make_bars(eur15, start15, 15, spread=0.0001),
         ("XAUUSD", "M5"): make_bars(gold5, start5, 5, spread=2.0),
+        ("XAUUSD", "M1"): make_bars(np.full(120, 2651.0), NOW - timedelta(minutes=120), 1,
+                                    spread=0.4),
     }
 
 
@@ -58,12 +64,16 @@ def trend_bars(drift: float, minutes: int):
     return make_bars(closes, NOW - timedelta(minutes=minutes * 400), minutes)
 
 
-def build(tmp_path, account, calendar=None, now=NOW, extra_rates=None):
+def build(tmp_path, account, calendar=None, now=NOW, extra_rates=None, independent=2651.0,
+          mode="paper", live_gate=None, conn_cls=FakeConnector, dry_run=True):
     cfg = AppConfig(state_file=str(tmp_path / "state.json"),
                     journal_file=str(tmp_path / "journal.csv"))
     cfg.news.cache_file = str(tmp_path / "cal.json")
-    conn = FakeConnector({**bullish_market(), **(extra_rates or {})},
-                         Tick(2651.0, 2651.3, 1), account)
+    cfg.risk.db_file = str(tmp_path / "risk.db")
+    cfg.risk.kill_flag_file = str(tmp_path / "ops" / "KILL")
+    cfg.risk.changelog_file = str(tmp_path / "CHANGELOG.md")
+    conn = conn_cls({**bullish_market(), **(extra_rates or {})},
+                    Tick(2651.0, 2651.3, 1), account, dry_run=dry_run)
     clock = lambda: now  # noqa: E731
     state = StateStore(cfg.state_file)
     macro = MacroDataEngine(cfg.strategy, fetcher=yield_drop, clock=clock)
@@ -74,8 +84,11 @@ def build(tmp_path, account, calendar=None, now=NOW, extra_rates=None):
         def json(self): return calendar or []
 
     news = NewsFilterEngine(cfg.news, http_get=lambda *a, **k: Resp(), clock=clock)
-    risk = RiskManager(cfg.risk, conn, state, clock=clock)
-    bot = BotOrchestrator(cfg, conn, macro, news, risk, state, clock=clock)
+    risk = RiskManager(cfg.risk)
+    suite = build_suite(cfg)
+    feed = (lambda symbol: independent) if independent is not None else None
+    bot = BotOrchestrator(cfg, conn, macro, news, risk, state, suite, clock=clock,
+                          mode=mode, live_gate=live_gate, independent_feed=feed)
     bot.setup()
     return bot, conn
 
@@ -87,6 +100,7 @@ def test_full_bullish_stack_places_buy(tmp_path, account):
     assert len(opens) == 1 and opens[0][1] == "BUY"
     _, _, volume, sl, tp = opens[0]
     assert sl < 2651.3 < tp and volume > 0
+    assert volume * (2651.3 - sl) * 100 <= 25.0001            # <= 0.25% of $10,000
     journal = (tmp_path / "journal.csv").read_text()
     assert "BUY" in journal and ",70," in journal  # 25+20+20+5, trend unknown
 
@@ -124,16 +138,38 @@ def test_pre_news_halves_loser(tmp_path, account):
     assert ("close", 1, 0.10) in conn.sent
 
 
-def test_guardrail_flattens_and_halts(tmp_path, account):
+def test_a_fast_equity_drop_trips_the_kill_switch_and_flattens(tmp_path, account):
     bot, conn = build(tmp_path, account)
     conn.open_positions = [long_position()]
-    bot.step()  # records day start balance 10k
-    conn.acc = replace(account, equity=9_650.0)
+    bot.step()                                      # records equity 10,000
+    conn.acc = replace(account, equity=9_650.0)     # -3.5% inside the same 15 minutes
     bot._last_bar = None
     conn.sent.clear()
     bot.step()
     assert ("close", 1, 0.10) in conn.sent
     assert not [s for s in conn.sent if s[0] == "open"]
+    assert bot.suite.kill.is_killed() and "PNL_DROP" in bot.suite.kill.reasons()
+    assert bot.status()["mode"] == "KILLED"
+
+
+def test_a_slow_two_percent_loss_blocks_entries_but_leaves_positions_alone(tmp_path, account):
+    bot, conn = build(tmp_path, account)
+    conn.open_positions = [long_position()]
+    bot.step()
+    later = NOW + timedelta(minutes=20)
+    bot._clock = lambda: later
+    conn.acc = replace(account, equity=9_790.0)     # -2.1%, spread over 20 minutes
+    conn.sent.clear()
+    bot.step()
+    assert not [s for s in conn.sent if s[0] == "close"]          # CLAUDE.md: stop entries only
+    status = bot.status()
+    assert status["halted"] and "DAILY_LOSS" in status["halt_reason"]
+    conn.open_positions = []
+    bot.cfg.execution.cooldown_minutes = 0          # isolate the loss limit from the cooldown
+    bot._last_bar = None
+    bot.step()
+    assert not [s for s in conn.sent if s[0] == "open"]
+    assert "REJECTED DAILY_LOSS" in (tmp_path / "journal.csv").read_text()
 
 
 def test_outside_session_skips(tmp_path, account):
@@ -305,9 +341,9 @@ def test_risk_and_shock_alerts_sent_once(tmp_path, account):
     shocks = [t for c, t in rec.msgs if c == "shock" and "AI SHOCK" in t]
     assert len(shocks) == 1 and "Emergency Fed meeting" in shocks[0]
 
-    conn.acc = replace(account, equity=9_600.0)
+    conn.acc = replace(account, equity=9_790.0)
     bot.step()
-    assert any(c == "risk" and "DAILY LOSS LIMIT" in t for c, t in rec.msgs)
+    assert any(c == "risk" and "DAILY_LOSS" in t for c, t in rec.msgs)
 
 
 def test_connection_lost_and_restored_alerts(tmp_path, account):
@@ -355,3 +391,171 @@ def test_entry_breakdown_saved_for_attribution(tmp_path, account):
     bot.step()
     meta = bot.state.get("trade_meta")["777"]
     assert meta["total"] == 70 and meta["parts"]["yield"] == 25
+
+
+# --------------------------------------------------------------------------- #
+# Prime directives at whole-bot level (CLAUDE.md section 0)
+# --------------------------------------------------------------------------- #
+class FillConn(FakeConnector):
+    """A fake broker that really opens a position, so post-fill checks can run."""
+    drop_stop = False
+    slip = 0.0
+
+    def open_market(self, symbol, side, volume, sl, tp, comment):
+        self.sent.append(("open", side, volume, sl, tp))
+        self.open_positions.append(PositionInfo(
+            ticket=900, symbol=symbol, side=side, volume=volume,
+            price_open=2651.3 + self.slip, sl=0.0 if self.drop_stop else sl, tp=tp,
+            profit=0.0, magic=20260926))
+        return OrderResult(ok=True, retcode=10009, ticket=900, price=2651.3, dry_run=False)
+
+
+def journal(tmp_path):
+    return (tmp_path / "journal.csv").read_text()
+
+
+def test_the_engine_vetoes_everything(tmp_path, account):
+    bot, conn = build(tmp_path, account)
+    bot.suite.engine.approve = lambda intent, state: RiskDecision(False, "TEST_VETO", "no")
+    bot.step()
+    assert not opens(conn)
+    assert "REJECTED TEST_VETO" in journal(tmp_path)
+
+
+def test_size_comes_from_the_engine_never_from_the_strategy(tmp_path, account):
+    bot, conn = build(tmp_path, account)
+    bot.step()
+    assert opens(conn)[0][2] == 0.04                  # $25 / ~$611 per lot, floored
+    decision = bot.suite.store.decisions(1)[0]
+    assert decision["approved"] == 1 and decision["size"] == 0.04
+    assert decision["strategy"] == "gold_macro"
+
+
+def test_without_an_independent_feed_every_entry_is_rejected(tmp_path, account):
+    bot, conn = build(tmp_path, account, independent=None)
+    bot.step()
+    assert not opens(conn) and "REJECTED NO_INDEPENDENT_FEED" in journal(tmp_path)
+
+
+def test_a_dry_run_can_never_trip_the_kill_switch(tmp_path, account):
+    bot, conn = build(tmp_path, account)
+    for _ in range(6):                                # six dry-run "orders" (retcode 0 each)
+        bot._last_bar = None
+        bot.step()
+    assert len(opens(conn)) == 6 and not bot.suite.kill.is_killed()
+
+
+def test_kill_flag_flattens_persists_and_needs_a_signed_reset(tmp_path, account):
+    bot, conn = build(tmp_path, account)
+    conn.open_positions = [long_position()]
+    flag = tmp_path / "ops" / "KILL"
+    flag.parent.mkdir()
+    flag.write_text("")
+    bot.step()
+    assert ("close", 1, 0.10) in conn.sent and bot.status()["mode"] == "KILLED"
+    flag.unlink()
+    bot.step()
+    assert bot.suite.kill.is_killed()                 # removing the file is not a reset
+    conn.sent.clear()
+    bot.suite.kill.reset("Flag was a test", "tester", NOW)
+    conn.open_positions = []
+    bot.step()
+    assert not bot.suite.kill.is_killed() and bot.status()["mode"] == "DRY-RUN"
+    assert "KILL RESET" in (tmp_path / "CHANGELOG.md").read_text(encoding="utf-8")
+
+
+def test_ladder_l2_blocks_entries_and_l3_kills(tmp_path, account):
+    bot, conn = build(tmp_path, account)
+    bot.step()                                        # high-water mark 10,000
+    bot._clock = lambda: NOW + timedelta(minutes=30)
+    conn.acc = replace(account, equity=9_250.0)       # -7.5%
+    bot._last_bar = None
+    bot.step()
+    risk = bot.status()["risk"]
+    assert risk["ladder_level"] == 2 and "LADDER_L2" in risk["blocked"]
+    conn.open_positions = [long_position()]
+    bot._clock = lambda: NOW + timedelta(hours=2)
+    conn.acc = replace(account, equity=8_990.0)       # -10.1%
+    bot.step()
+    assert bot.suite.kill.is_killed() and "LADDER_L3" in bot.suite.kill.reasons()
+    assert ("close", 1, 0.10) in conn.sent
+
+
+def test_a_good_fill_is_booked_and_the_stop_is_verified(tmp_path, account):
+    bot, conn = build(tmp_path, account, conn_cls=FillConn, dry_run=False)
+    bot.step()
+    assert len(opens(conn)) == 1 and not [s for s in conn.sent if s[0] == "close"]
+    day = bot._day_key(NOW)
+    assert bot.suite.ledger.trades_today(day) == 1
+    assert 0 < bot.suite.ledger.risk_for(900) <= 25.0001
+
+
+def test_a_position_without_a_stop_is_closed_immediately(tmp_path, account):
+    bot, conn = build(tmp_path, account, conn_cls=FillConn, dry_run=False)
+    conn.drop_stop = True
+    bot.step()
+    assert ("close", 900, opens(conn)[0][2]) in conn.sent
+    assert any("NO STOP-LOSS" in e["text"] for e in bot.status()["events"])
+
+
+def test_a_fill_over_ten_percent_above_planned_risk_is_closed(tmp_path, account):
+    bot, conn = build(tmp_path, account, conn_cls=FillConn, dry_run=False)
+    conn.slip = 3.0                                   # filled $3 worse than planned
+    bot.step()
+    assert any(s[0] == "close" and s[1] == 900 for s in conn.sent)
+    assert any("more than 10% above" in e["text"] for e in bot.status()["events"])
+
+
+def test_a_closed_trade_is_booked_with_its_r_multiple(tmp_path, account):
+    bot, conn = build(tmp_path, account, conn_cls=FillConn, dry_run=False)
+    bot.step()
+    risk = bot.suite.ledger.risk_for(900)
+    conn.open_positions = []
+    conn.deals = closed_deals(900, -risk)             # lost exactly 1R
+    bot.step()
+    assert bot.suite.ledger.streak().consecutive_losses == 1
+    assert bot.suite.ledger.losing_today(bot._day_key(NOW)) == 1
+    assert any("-1.00R" in e["text"] for e in bot.status()["events"])
+
+
+def test_unbooked_closes_wait_for_the_broker_history(tmp_path, account):
+    bot, conn = build(tmp_path, account, conn_cls=FillConn, dry_run=False)
+    bot.step()
+    conn.open_positions = []                          # closed, but no deals in history yet
+    bot.step()
+    assert bot.suite.ledger.streak().consecutive_losses == 0 and bot._pending_close
+    conn.deals = closed_deals(900, -20.0)
+    bot.step()
+    assert not bot._pending_close and bot.suite.ledger.streak().consecutive_losses == 1
+
+
+def test_live_gate_failure_locks_the_bot_out_of_sending_orders(tmp_path, account):
+    gate = lambda login: GateResult(False, ["TYPED: type exactly 'LIVE 1'"])  # noqa: E731
+    bot, conn = build(tmp_path, account, mode="live", live_gate=gate, dry_run=False)
+    assert conn.dry_run is True and bot.live_gate_ok is False
+
+
+def test_live_on_a_real_account_is_refused_while_the_stage_is_demo(tmp_path, account):
+    real = replace(account, is_demo=False)
+    bot, conn = build(tmp_path, real, mode="live", dry_run=False,
+                      live_gate=lambda login: GateResult(True))
+    assert bot.live_gate_ok and conn.dry_run is False
+    bot.step()
+    assert not opens(conn) and "REJECTED STAGE_MISMATCH" in journal(tmp_path)
+
+
+def test_paper_mode_refuses_a_real_account(tmp_path, account):
+    real = replace(account, is_demo=False)
+    bot, conn = build(tmp_path, real, mode="paper", dry_run=False)
+    bot.step()
+    assert not opens(conn) and "REJECTED MODE_MISMATCH" in journal(tmp_path)
+
+
+def test_status_publishes_the_risk_state(tmp_path, account):
+    import json
+    bot, conn = build(tmp_path, account)
+    bot.step()
+    risk = bot.status()["risk"]
+    json.dumps(bot.status(), allow_nan=False)
+    assert risk["stage"] == "demo" and risk["per_trade_pct"] == 0.25
+    assert risk["last_decision"]["approved"] is True and risk["mode"] == "paper"

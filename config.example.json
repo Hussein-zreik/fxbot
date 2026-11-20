@@ -150,14 +150,17 @@
     "recent_trades": 20
   },
   "risk": {
-    "risk_per_trade": 0.01,
     "sl_atr_mult": 1.5,
     "tp_atr_mult": 3.0,
-    "max_daily_loss": 0.03,
-    "close_all_account_positions_on_halt": false,
-    "max_spread_points": 60,
     "max_lot": 5.0,
-    "margin_usage_limit": 0.9
+    "close_all_account_positions_on_halt": false,
+    "limits_file": "",
+    "overrides": {},
+    "db_file": "data/risk.db",
+    "kill_flag_file": "ops/KILL",
+    "changelog_file": "CHANGELOG.md",
+    "live_confirm_file": "LIVE_CONFIRM",
+    "_comment": "The LIMITS (per-trade risk, daily/weekly loss, leverage, ladder...) live in risk/limits.yaml and are hard-capped in code. 'overrides' here may only TIGHTEN them, e.g. {\"max_trades_per_day\": 2}; anything looser stops the bot from starting."
   },
   "execution": {
     "dry_run": true,

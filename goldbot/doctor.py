@@ -19,6 +19,7 @@ import requests
 
 from .config import AppConfig, load_config
 from .news_filter import parse_calendar
+from .risk.rules import Limits, LimitsError, load_limits, tighten
 from .secrets_file import DEFAULT_PATH, load_secrets_file
 
 OK, WARN, FAIL, SKIP = "ok", "warn", "fail", "skip"
@@ -63,6 +64,46 @@ def _config(cfg: AppConfig) -> Check:
     mode = "DRY-RUN (no real orders)" if cfg.execution.dry_run else "orders ENABLED"
     return Check("Config", OK, f"valid; {mode}; live accounts "
                  f"{'allowed' if cfg.execution.allow_live_trading else 'blocked'}")
+
+
+def _limits(cfg: AppConfig) -> Limits:
+    return tighten(load_limits(cfg.risk.limits_file or None), cfg.risk.overrides)
+
+
+def _risk_checks(cfg: AppConfig, env) -> List[Check]:
+    """The rulebook must load, and the bot's own safety switches must be in a safe state."""
+    out: List[Check] = []
+    try:
+        lim = _limits(cfg)
+    except LimitsError as exc:
+        return [Check("Risk rulebook", FAIL, str(exc)[:200],
+                      "risk/limits.yaml is invalid or looser than the hard caps. "
+                      "Restore it from the repository; never loosen it by hand.")]
+    out.append(Check("Risk rulebook", OK,
+                     f"stage '{lim.stage}': {lim.per_trade_cap()}% per trade, daily loss "
+                     f"{lim.daily_loss_limit_pct}%, max {lim.max_open_positions} positions, "
+                     f"{lim.max_effective_leverage:g}x leverage cap"))
+    mode = env.get("MODE", "paper").strip().lower() or "paper"
+    if mode not in ("paper", "live"):
+        out.append(Check("Mode", WARN, f"MODE={mode!r} is not recognised - paper is used"))
+    elif mode == "live":
+        out.append(Check("Mode", WARN, "MODE=live requested",
+                         "Live also needs the account number in config, a LIVE_CONFIRM file "
+                         "with today's date and a typed confirmation at startup."))
+    else:
+        out.append(Check("Mode", OK, "paper (the safe default)"))
+    out.append(Check("Independent price feed", WARN,
+                     "not configured: every entry is rejected (NO_INDEPENDENT_FEED)",
+                     "The rulebook requires a price check against an independent feed. "
+                     "Until that feed is built the bot can only run in dry-run."))
+    from pathlib import Path
+    if Path(cfg.risk.kill_flag_file).exists():
+        out.append(Check("Kill flag", FAIL, f"{cfg.risk.kill_flag_file} exists",
+                         "Remove the file, then run: python -m goldbot.riskctl reset-kill "
+                         "--note \"why it is safe\""))
+    else:
+        out.append(Check("Kill flag", OK, "not set"))
+    return out
 
 
 def _secret_checks(cfg: AppConfig, env) -> List[Check]:
@@ -213,8 +254,9 @@ def _mt5(cfg: AppConfig, connector_factory: Optional[Callable]) -> List[Check]:
             tick = conn.get_tick(gold)
             if tick:
                 spread = (tick.ask - tick.bid) / conn.symbol_spec(gold).point
-                out.append(Check("Spread", OK if spread <= cfg.risk.max_spread_points else WARN,
-                                 f"{spread:.0f} points (limit {cfg.risk.max_spread_points})"))
+                cap = _limits(cfg).filters.spread_max_points.get("XAUUSD", 50)
+                out.append(Check("Spread", OK if spread <= cap else WARN,
+                                 f"{spread:.0f} points (limit {cap:g})"))
             live = conn.market_is_live(gold)
             out.append(Check("Live prices", OK if live else WARN,
                              "ticking" if live else "no fresh ticks",
@@ -232,6 +274,7 @@ def run_checks(cfg: AppConfig, *, env=os.environ, connector_factory=None,
         from .macro_engine import fetch_yield_series_yfinance as yield_fetcher
     now = now or datetime.now(timezone.utc)
     checks = [_python(cfg), _packages(cfg), _config(cfg)]
+    checks += _risk_checks(cfg, env)
     checks += _secret_checks(cfg, env)
     checks += [_calendar(cfg, http_get), _yield(cfg, yield_fetcher, now),
                _groq(cfg, env, http_get), _telegram(cfg, env, http_post),

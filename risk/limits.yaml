@@ -1,0 +1,62 @@
+# risk/limits.yaml — Unified Risk Rulebook (shared with the course PDF, Module 6)
+version: 2
+stage: demo                     # demo | micro_live | scaled_1 | scaled_2  (set by human only)
+
+per_trade_risk_pct:             # % of current equity, from entry-to-stop distance × size
+  demo: 0.25
+  micro_live: 0.25
+  scaled_1: 0.50                # only after Gate 2
+  scaled_2: 1.00                # HARD MAX 1.00 — second scale-up review required
+max_open_risk_pct: 2.0          # sum of initial stop risks, all positions
+cluster_counts_as_one:          # correlated positions share one risk slot
+  - [XAUUSD, XAGUSD, GOLD, MGC]
+  - [EURUSD, GBPUSD, USDCHF_inv]
+  - [MES, MNQ]
+max_open_positions: 2           # and max 1 per symbol
+max_trades_per_day: 4
+max_effective_leverage: 5.0     # notional / equity
+max_margin_usage_pct: 30        # per broker
+crypto_max_equity_per_venue_pct: 15
+
+daily_loss_limit_pct: 2.0       # equity-based incl. floating; resets 00:00 server time
+daily_max_losing_trades: 3
+weekly_loss_limit_pct: 4.0
+consecutive_losses_halve: 4     # halve risk until +2R recovered
+consecutive_losses_stop_day: 6
+
+drawdown_ladder_from_hwm:       # high-water mark of equity
+  L1: {dd_pct: 5.0,  action: halve_risk_no_new_sleeves}
+  L2: {dd_pct: 7.5,  action: stop_entries_review_resume_at_0.25}
+  L3: {dd_pct: 10.0, action: kill_flatten_demo_only_manual_reset}
+
+filters:
+  news_blackout_min_before: 30
+  news_blackout_min_after: 15
+  news_impact_levels: [high]    # CPI, NFP, FOMC, PCE (+ ECB/BoE for EUR/GBP symbols)
+  news_currencies: {XAUUSD: [USD], EURUSD: [USD, EUR], GBPUSD: [USD, GBP], USDJPY: [USD, JPY]}
+  calendar_fail_closed_windows_beirut: ["15:15-16:45", "20:45-22:00"]   # if calendar fetch fails
+  spread_max_mult_of_hour_median: 2.0
+  spread_max_points: {XAUUSD: 50}       # 50 points = $0.50 on a 2-digit quote
+  no_entry_windows_server: ["23:45-00:30", "Fri 20:00-Sun 23:59"]
+  min_reward_risk: 1.5
+  price_sanity_atr1m_mult: 3.0          # order price within 3×ATR(1m) of independent mid
+  fat_finger_size_mult: 3.0             # size ≤ 3× median size of last 50 orders
+
+portfolio:                       # Phase 2 only
+  vol_target_annual: 0.10        # HARD MAX 0.15
+  max_ex_ante_vol_mult: 1.25
+  es_975_1d_max_pct: 2.5
+  weekend_gap_scenario_max_loss_pct: 6.0
+  gap_scenario: {XAUUSD: -0.08, FX_major: -0.03, BTC: -0.20, MES: -0.07}
+  max_instrument_share_of_risk: 0.25
+  max_cluster_share_of_risk: 0.40
+
+orders:
+  max_orders_per_min_per_adapter: 20
+  max_modifications_per_order: 5
+  requote_retries: 2
+  require_broker_side_sl: true
+
+human:
+  no_risk_increase_hours_after_night_shift: 12
+  risk_increase_cooling_off_hours: 48

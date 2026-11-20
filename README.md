@@ -4,7 +4,7 @@ A Python bot for XAUUSD (gold) that runs through the official `MetaTrader5`
 library. It scores six independent signal blocks on a -100 to +100 scale:
 macro data, the dollar, silver, multi-timeframe trend, AI-read news headlines
 and a VWAP retest. It trades only when enough of them agree and never against
-the 4-hour trend. Every order has ATR-based stops and fixed 1% risk sizing.
+the 4-hour trend. Every order has ATR-based stops and is sized by the risk rulebook (0.25% of equity per trade at the demo stage).
 
 > **Risk notice.** This is software, not financial advice. The rules are
 > reasonable hypotheses, but nobody has backtested them. Run it in dry-run
@@ -40,8 +40,7 @@ Every weight is editable in the config.
 - Maximum open positions reached (default 1).
 - Post-exit cooldown (default 15 min).
 - Outside session hours (default 07:00–20:00 UTC) or on a non-trading weekday.
-- Spread too wide (default 60 points = $0.60).
-- Daily loss guardrail triggered.
+- **Any failed rulebook check** (spread, leverage, daily/weekly loss, drawdown ladder, news, price sanity...). See *Risk rulebook* below.
 
 **AI shock pause:**
 - The AI also gives each headline a "shock" rating: how sudden and unscheduled the event is (war, emergency Fed action, surprise default).
@@ -58,17 +57,16 @@ close anything. Switch it off with `trend.exit_on_reversal`.
 - **Losing** → 50% of the position is closed.
 - **Too small to split** → closed fully. Configurable with `news.close_fully_if_unsplittable`.
 
-**Risk:**
+**Risk:** the full rulebook is in [Risk rulebook](#risk-rulebook-claudemd) below. In short:
 
 ```
-lots = (equity × 1%) / loss_per_lot
+lots = floor_to_step( (equity × 0.25%) / (|entry - SL| / tick_size × tick_value) )
 SL   = 1.5 × ATR(14)
-TP   = 3.0 × ATR(14)   (1:2 reward-to-risk)
+TP   = 3.0 × ATR(14)   (1:2 reward-to-risk; the rulebook demands at least 1:1.5)
 ```
 
-- `loss_per_lot` comes from the broker's own `order_calc_profit`. This handles contract size (100 oz vs 1 oz) and account currency. The fallback is `(SL distance / tick size) × tick value`.
-- Lot size is always rounded **down**. If even the minimum lot would risk more than 1%, the trade is skipped rather than oversized.
-- **Daily guardrail:** if equity falls 3% below the day's starting balance, the bot closes all positions and halts until 00:00 UTC. The starting balance is recorded at 00:00 UTC. This state is saved to disk, so a restart cannot reset it.
+- Lot size is always rounded **down**. If even the minimum lot would risk more than the allowance, the trade is skipped rather than oversized.
+- Only `risk/sizing.py` computes lots, and only `RiskEngine.approve()` can let an order through.
 
 Entries are evaluated **once per closed M5 bar**, so live behaviour matches a
 bar-by-bar backtest of the same rules. Every bar is logged to
@@ -101,7 +99,7 @@ goldbot/
   orchestrator.py          BotOrchestrator – 10-second main loop, news management, journal
   indicators.py            pure indicator functions
   state.py                 crash-safe persistent state (data/state.json)
-tests/                     131 tests using a fake MT5 connector (run anywhere)
+tests/                     268+ tests using a fake MT5 connector (run anywhere)
 ```
 
 ---
@@ -241,7 +239,7 @@ The detailed manual steps below remain as a fallback, or if you want to understa
       `BAR 13:05Z | score +65 (Y+25 D+20 S+0 T+20 N+0 V+0) | … | trend H4 UP H1 UP | AI +0.42 (7) | …`
       The letters are Y = yield, D = dollar, S = silver, T = trend, N = AI news, V = VWAP.
 14. **Switch to demo trading:** set `execution.dry_run: false` and restart.
-15. **Live trading later** needs **both** `dry_run: false` **and** `allow_live_trading: true`. If a real account is detected without the second flag, the bot forces itself back into dry-run and logs a CRITICAL message.
+15. **Live trading later** needs the four-part live gate (see *Risk rulebook*): `MODE=live`, the account number in `config.json`, a `LIVE_CONFIRM` file with today's date, and a typed confirmation at startup. Missing any one keeps the bot in paper mode (and on a real account it sends nothing).
 
 ### D. Keep it running 24/5
 16. Run it with **`start_bot.bat`**, which restarts the bot 30 seconds after any crash or exit.
@@ -335,7 +333,7 @@ No firewall ports are opened.
 | Key | Default | Meaning |
 |---|---|---|
 | `execution.dry_run` | `true` | Log orders instead of sending them |
-| `execution.allow_live_trading` | `false` | Required for real-money accounts |
+| `MODE` (environment) | `paper` | `live` is only honoured with the full four-part live gate |
 | `execution.max_open_positions` | `1` | Forced to 1 on netting accounts |
 | `execution.session_filter_enabled` | `true` | Only enter between `session_start_utc` and `session_end_utc` |
 | `execution.cooldown_minutes` | `15` | Wait after a position closes |
@@ -358,9 +356,8 @@ No firewall ports are opened.
 | `dashboard.allow_close_all` | `true` | Show the Close-all button |
 | `strategy.yield_trigger_bp` | `2.0` | Basis points in 15 min |
 | `strategy.min_correlation` | `0.6` | Gold/silver return correlation needed for confluence |
-| `risk.risk_per_trade` | `0.01` | 1% of equity |
-| `risk.max_daily_loss` | `0.03` | 3% daily halt |
-| `risk.max_spread_points` | `60` | Skip entries on wider spreads |
+| `risk.overrides` | `{}` | May only TIGHTEN `risk/limits.yaml`, e.g. `{"max_trades_per_day": 2}` |
+| `risk.max_lot` | `5.0` | Tightens the broker's maximum lot |
 | `risk.close_all_account_positions_on_halt` | `false` | `true` = the guardrail also closes manual trades |
 | `news.fail_closed` | `true` | No calendar data → no new entries |
 
@@ -386,6 +383,58 @@ No firewall ports are opened.
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q        # 131 tests, no MT5 needed
+python -m pytest -q        # 268+ tests, no MT5 needed
 python -m flake8 --max-line-length 100 goldbot run_bot.py tests
 ```
+
+---
+
+## 8. Risk rulebook (CLAUDE.md)
+
+The bot now follows the **Unified Risk Rulebook** in `CLAUDE.md` / `risk/limits.yaml`.
+Code never edits that file. Its values are hard-capped at load time: a looser value
+stops the bot from starting, and `risk.overrides` in `config.json` can only tighten.
+
+**Every order passes `RiskEngine.approve()`** (prime directive 2), which runs these checks
+in order and records the verdict in `data/risk.db`:
+
+| # | Check | Demo-stage limit |
+|---|---|---|
+| 1 | Kill flag, halts, broker connected, clock drift | drift < 250 ms |
+| 2 | Mode and account match | paper = demo account; live = real account + gate |
+| 3 | News blackout, no-entry windows, stale calendar | 30 min before / 15 after; 23:45-00:30 and Fri 20:00-Sun server time |
+| 4 | Spread | <= 2x the hour's median and <= 50 points |
+| 5 | Stop-loss placement | correct side, beyond stops level and freeze level |
+| 6 | Reward : risk | >= 1.5 |
+| 7 | Per-trade risk | 0.25% (halved at ladder L1 or after 4 losses until +2R) |
+| 8 | Exposure | 2 open risk %, max 2 positions, 1 per symbol, correlated metals = 1 slot, 4 trades/day |
+| 9 | Leverage and margin | <= 5x notional/equity, <= 30% margin |
+| 10 | Loss limits | day -2%, week -4%, 3 losing trades/day, 6 losses stop the day, ladder |
+| 11 | Price sanity and size | within 3x ATR(1m) of an independent price; size <= 3x recent median |
+
+**Drawdown ladder** (from the equity high): **L1 5%** halves risk; **L2 7.5%** stops entries until you
+review; **L3 10%** triggers the kill switch.
+
+**Kill switch** (flattens and halts) triggers on: the `ops/KILL` file, ladder L3, 3 order errors in a
+row, more than 50 orders in 5 minutes, a 3% equity drop within 15 minutes, a reconciliation mismatch
+for 5 minutes, equity data missing for 5 minutes with positions open, or more than 3 unknown MT5
+codes in 10 minutes. It stays tripped across restarts.
+
+**Human-only controls** (each needs a written note, which is appended to `CHANGELOG.md`):
+
+```powershell
+python -m goldbot.riskctl status
+python -m goldbot.riskctl reset-kill   --note "why it is safe" --author "Hussein"
+python -m goldbot.riskctl reset-ladder --note "what I reviewed" --author "Hussein"
+python -m goldbot.riskctl clear-halt   --note "account topped up"
+```
+
+Remove the `ops/KILL` file before `reset-kill`. After `reset-ladder`, risk is capped at 0.25% until you change it.
+
+**What changed from the earlier version** (the rulebook wins over the old settings):
+- Risk per trade is **0.25%**, not 1%. Daily loss limit is **2%**, not 3%, and it now **blocks new entries** instead of closing open trades (open trades keep their stop-loss and take-profit).
+- The day and week reset at **broker server midnight**, not UTC.
+- A **drawdown ladder**, weekly limit, trade-count limits, leverage and margin caps, and a kill switch are new.
+- After every fill the bot checks the stop-loss is really attached and the real risk is within 110% of plan; otherwise it closes the position at once.
+
+**Known gap that blocks all trading today:** check 11 needs an *independent* price feed (for example Dukascopy), which is not built yet. Until it exists, every entry is rejected with `NO_INDEPENDENT_FEED`, so the bot can only run in dry-run. The doctor shows this as a warning.

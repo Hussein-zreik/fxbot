@@ -45,7 +45,7 @@ h2 { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacin
 .pill.LIVE { background: var(--up-bg); color: var(--up); }
 .pill.DRY-RUN { background: var(--info-bg); color: var(--info); }
 .pill.PAUSED { background: var(--warn-bg); color: var(--warn); }
-.pill.HALTED, .pill.DISCONNECTED, .pill.OFFLINE { background: var(--down-bg); color: var(--down); }
+.pill.HALTED, .pill.KILLED, .pill.DISCONNECTED, .pill.OFFLINE { background: var(--down-bg); color: var(--down); }
 .sub { color: var(--muted); font-size: 13px; }
 .row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
 .big { font-size: 30px; font-weight: 700; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
@@ -350,7 +350,7 @@ table.t td { text-align: right; padding: 7px 0; border-top: 1px solid var(--line
     if (ai.shock_active) $("bannerShock").textContent =
       "⚠ AI shock pause until " + hhmm(ai.shock_until) + ": " + (ai.shock_headline || "");
     show($("bannerHalt"), !!s.halted);
-    if (s.halted) $("bannerHalt").textContent = "Daily loss limit hit - " + s.halt_reason;
+    if (s.halted) $("bannerHalt").textContent = (s.mode === "KILLED" ? "KILL SWITCH - " : "New entries blocked - ") + s.halt_reason;
     var news = s.news || {};
     show($("bannerNews"), !!news.blackout);
     if (news.blackout) $("bannerNews").textContent = "News blackout: " + news.reason;

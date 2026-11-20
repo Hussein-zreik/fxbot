@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
@@ -50,6 +51,8 @@ class SymbolSpec:
     volume_step: float
     stops_level: int
     filling_type: int
+    contract_size: float = 100.0
+    freeze_level: int = 0
 
 
 @dataclass
@@ -130,6 +133,7 @@ class MT5Connector:
         self.dry_run = exec_cfg.dry_run
         self._connected = False
         self._spec_cache: Dict[str, SymbolSpec] = {}
+        self._drift_samples: deque = deque(maxlen=40)
         self._last_tick_msc: Dict[str, int] = {}
         self._last_tick_change: Dict[str, float] = {}
         self._utc_offset_s: Optional[int] = (
@@ -267,7 +271,8 @@ class MT5Connector:
             tick_value=info.trade_tick_value,
             volume_min=info.volume_min, volume_max=info.volume_max,
             volume_step=info.volume_step, stops_level=info.trade_stops_level,
-            filling_type=filling,
+            filling_type=filling, contract_size=info.trade_contract_size,
+            freeze_level=info.trade_freeze_level,
         )
         self._spec_cache[symbol] = spec
         return spec
@@ -286,6 +291,9 @@ class MT5Connector:
                 self._last_tick_change[symbol] = now
                 if self._utc_offset_s is None:
                     self._detect_utc_offset(tick.time, now)
+                else:  # local clock vs broker clock: local - (server - offset)
+                    self._drift_samples.append(
+                        now * 1000 - (tick.time_msc - self._utc_offset_s * 1000))
         return Tick(bid=tick.bid, ask=tick.ask, time_msc=tick.time_msc)
 
     def _detect_utc_offset(self, server_ts: int, now: float) -> None:
@@ -300,6 +308,31 @@ class MT5Connector:
         self.get_tick(symbol)
         last = self._last_tick_change.get(symbol)
         return last is not None and time.time() - last <= self.exec_cfg.market_stale_seconds
+
+    def clock_drift_ms(self) -> Optional[float]:
+        """Estimated local-vs-broker clock error in ms (None until enough fresh ticks).
+
+        Each sample is drift + network latency + tick age, all of which only ADD to
+        the true drift, so the smallest recent sample is the best estimate.
+        """
+        if len(self._drift_samples) < 3:
+            return None
+        return float(min(self._drift_samples))
+
+    def hourly_spread_median(self, symbol: str, hour_utc: int, days: int = 7
+                             ) -> Optional[float]:
+        """Median spread (points) of this symbol during the given UTC hour, last N days."""
+        try:
+            rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 1, days * 96)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("spread history failed: %s", exc)
+            return None
+        if rates is None or len(rates) == 0:
+            return None
+        df = pd.DataFrame(rates)
+        hours = ((df["time"] - self.utc_offset_seconds) // 3600) % 24
+        sample = df.loc[hours == hour_utc, "spread"]
+        return float(sample.median()) if len(sample) >= 20 else None
 
     @property
     def utc_offset_seconds(self) -> int:

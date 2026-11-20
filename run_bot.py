@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from goldbot.config import AppConfig, load_config
+from goldbot.clock import beirut_time
 from goldbot.dashboard import DashboardServer
 from goldbot.macro_engine import MacroDataEngine
 from goldbot.mt5_connector import MT5Connector
 from goldbot.news_filter import NewsFilterEngine
 from goldbot.notifier import TelegramNotifier
 from goldbot.orchestrator import BotOrchestrator
+from goldbot.risk.livegate import GateResult, check_live_gate
+from goldbot.risk.suite import build_suite
 from goldbot.risk_manager import RiskManager
 from goldbot.secrets_file import DEFAULT_PATH, load_secrets_file
 from goldbot.sentiment_engine import SentimentEngine
@@ -37,16 +42,45 @@ def setup_logging(cfg: AppConfig) -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-def build_bot(cfg: AppConfig) -> BotOrchestrator:
+def resolve_mode() -> str:
+    mode = os.getenv("MODE", "paper").strip().lower() or "paper"
+    if mode not in ("paper", "live"):
+        logging.getLogger("goldbot").warning("Unknown MODE=%r - using paper", mode)
+        return "paper"
+    return mode
+
+
+def make_live_gate(cfg: AppConfig, typed: str):
+    """Closure the orchestrator calls once the real account number is known."""
+    def gate(account_login: int) -> GateResult:
+        now = datetime.now(timezone.utc)
+        confirm = None
+        try:
+            with open(cfg.risk.live_confirm_file, "r", encoding="utf-8") as fh:
+                confirm = fh.read()
+        except OSError:
+            pass
+        return check_live_gate(env=os.environ, account_login=account_login,
+                               expected_login=cfg.mt5.login or None, utc_today=now.date(),
+                               beirut_today=beirut_time(now).date(), confirm_text=confirm,
+                               typed=typed or None)
+    return gate
+
+
+def build_bot(cfg: AppConfig, mode: str = "paper", typed: str = "") -> BotOrchestrator:
     state = StateStore(cfg.state_file)
+    suite = build_suite(cfg)                       # raises if limits.yaml is looser than caps
+    # Real accounts stay locked unless MODE=live; the full four-part gate is checked later.
+    cfg.execution.allow_live_trading = mode == "live"
     connector = MT5Connector(cfg.mt5, cfg.execution)
     macro = MacroDataEngine(cfg.strategy)
     news = NewsFilterEngine(cfg.news)
-    risk = RiskManager(cfg.risk, connector, state)
+    risk = RiskManager(cfg.risk)
     sentiment = SentimentEngine(cfg.ai_news)
     notifier = TelegramNotifier(cfg.alerts)
-    return BotOrchestrator(cfg, connector, macro, news, risk, state,
-                           sentiment=sentiment, notifier=notifier)
+    return BotOrchestrator(cfg, connector, macro, news, risk, state, suite,
+                           sentiment=sentiment, notifier=notifier, mode=mode,
+                           live_gate=make_live_gate(cfg, typed))
 
 
 def main() -> int:
@@ -69,7 +103,20 @@ def main() -> int:
     if not Path(args.config).exists():
         log.warning("Config %s not found - running with built-in defaults", args.config)
 
-    bot = build_bot(cfg)
+    mode = resolve_mode()
+    typed = ""
+    if mode == "live":
+        if sys.stdin and sys.stdin.isatty():
+            typed = input("MODE=live. To trade real money type  LIVE <your account number>  : ")
+        else:
+            log.warning("MODE=live but there is no keyboard to type the confirmation: the "
+                        "bot will stay locked out of live trading.")
+    log.info("Mode: %s%s", mode, " (default)" if mode == "paper" else "")
+    try:
+        bot = build_bot(cfg, mode, typed.strip())
+    except ValueError as exc:                      # LimitsError is a ValueError
+        log.critical("Refusing to start: %s", exc)
+        return 1
     dashboard = DashboardServer(cfg.dashboard, bot)
     dashboard.start()
     try:
